@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+// A controllable stand-in for the real `claude` CLI, used by test/caps.test.ts
+// to exercise runGeneration's cap/cost logic without a real Claude Code
+// subscription. Behavior is selected via env vars, matching the pattern used
+// throughout this project's manual verification (mock claude binaries on PATH).
+const fs = require("fs");
+
+const mode = process.env.GRASP_TEST_MOCK_MODE || "normal";
+
+if (mode === "error") {
+  process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: "", is_error: true }));
+  process.exit(0);
+}
+
+if (mode === "bad-json-result") {
+  // Envelope itself is well-formed and reports a real cost, but `result`
+  // isn't the expected JSON contract — proves cost is still recorded on a
+  // malformed-response miss (see DECISIONS.md's malformed-response entry).
+  process.stdout.write(JSON.stringify({ total_cost_usd: 0.002, result: "not valid json at all", is_error: false }));
+  process.exit(0);
+}
+
+if (mode === "missing-cost") {
+  const result = {
+    worthAsking: true,
+    conceptTag: "missing-cost-tag",
+    questionConcept: "concept q",
+    questionInstance: "instance q",
+  };
+  process.stdout.write(JSON.stringify({ result: JSON.stringify(result), is_error: false }));
+  process.exit(0);
+}
+
+// mode === "normal": always worth asking, fresh concept tag per call (via a
+// counter file) so memoization never suppresses the concept question.
+const counterPath = process.env.GRASP_TEST_MOCK_COUNTER;
+let n = 0;
+if (counterPath) {
+  try {
+    n = parseInt(fs.readFileSync(counterPath, "utf-8"), 10) || 0;
+  } catch {
+    n = 0;
+  }
+  n += 1;
+  fs.writeFileSync(counterPath, String(n));
+}
+const cost = process.env.GRASP_TEST_MOCK_COST ? parseFloat(process.env.GRASP_TEST_MOCK_COST) : 0.001;
+const result = {
+  worthAsking: true,
+  conceptTag: `test-concept-${n}`,
+  questionConcept: `concept question ${n}`,
+  questionInstance: `instance question ${n}`,
+};
+process.stdout.write(JSON.stringify({ total_cost_usd: cost, result: JSON.stringify(result), is_error: false }));
