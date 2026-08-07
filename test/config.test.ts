@@ -153,6 +153,28 @@ test("loadConfig: rejects a malformed diffThresholds field", () => {
   assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /diffThresholds\.minChangedLines must be a non-negative number/);
 });
 
+// Regression coverage for a bug an independent test pass found: a
+// misspelled key (e.g. "gateMod" instead of "gateMode") used to be silently
+// accepted — deepMerge only reads keys it recognizes, so the typo'd key was
+// retained as inert dead data while the real gateMode silently stayed at
+// its default ("soft"), leaving the user believing hard-gating was enabled
+// when it wasn't. Unknown keys are now rejected at load time like every
+// other invalid value.
+
+test("loadConfig: rejects an unknown top-level key instead of silently ignoring it (typo'd gateMode)", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ gateMod: "hard" }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /unknown config key "gateMod"/);
+});
+
+test("loadConfig: rejects an unknown nested diffThresholds key", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ diffThresholds: { minChangedLinez: 5 } }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /unknown diffThresholds key "minChangedLinez"/);
+});
+
 test("loadConfig: a fully valid override with every key set still passes", () => {
   const graspHome = mkTempDir("grasp-test-home-");
   const globalConfigPath = path.join(graspHome, "config.json");

@@ -3,11 +3,14 @@ import Database from "better-sqlite3";
 import { DiffFile } from "./adapters/agentAdapter";
 import { GraspConfig } from "./types";
 import {
+  GENERATION_RESERVATION_STALE_MS,
   getAllAnsweredConceptTags,
   getConceptTagGlobal,
   getSessionCostUsd,
   getSessionQuestionCount,
   insertEvent,
+  releaseGenerationSlot,
+  tryClaimGenerationSlot,
 } from "./store";
 
 /**
@@ -28,6 +31,16 @@ const GENERATION_SOURCE = "headless-claude-p";
  * DECISIONS.md's "hardcoded vs configurable" entry for why.
  */
 const GENERATION_TIMEOUT_MS = 20_000;
+
+// GENERATION_TIMEOUT_MS must stay comfortably under
+// GENERATION_RESERVATION_STALE_MS (store.ts) — the reservation has to
+// outlive the longest a legitimate in-flight call can possibly take, or a
+// second process could steal an active (not actually abandoned) slot.
+if (GENERATION_TIMEOUT_MS >= GENERATION_RESERVATION_STALE_MS) {
+  throw new Error(
+    "GENERATION_TIMEOUT_MS must be well under GENERATION_RESERVATION_STALE_MS — see generation.ts/store.ts reservation comments"
+  );
+}
 
 export type MissReason = "cap_reached" | "error" | "timeout";
 
@@ -207,6 +220,57 @@ export function parseJudgeResponse(raw: string): JudgeResponse | null {
   };
 }
 
+// --- per-session generation mutex --------------------------------------------
+
+/**
+ * Blocks the current process (synchronously — everything in this module is
+ * sync, including the `claude -p` call itself) via `Atomics.wait` on a
+ * throwaway buffer. Not a busy-spin: the thread genuinely sleeps for `ms`.
+ * This is the standard technique for a synchronous sleep in Node with no
+ * external dependency.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+const SLOT_POLL_INTERVAL_MS = 100;
+/**
+ * How long a caller will wait for another process's in-flight generation
+ * call (for the SAME session_id) to finish before giving up. Set above
+ * GENERATION_RESERVATION_STALE_MS so a genuinely abandoned reservation is
+ * always reclaimed (by this same polling loop, via tryClaimGenerationSlot's
+ * own staleness check) before this caller gives up on it.
+ */
+const SLOT_ACQUIRE_MAX_WAIT_MS = GENERATION_RESERVATION_STALE_MS + 5_000;
+
+/**
+ * Serializes `runGeneration` calls for the same `sessionId` across however
+ * many separate OS processes are racing (e.g. several Claude Code
+ * `PostToolUse` hooks firing for near-simultaneous tool calls). This is
+ * what actually closes the cap-enforcement race: see DECISIONS.md's "Atomic
+ * cap enforcement" entry for the full story — reading spentSoFar/
+ * questionsSoFar and THEN making a slow external call meant any number of
+ * overlapping calls could all read the same pre-call totals and all decide
+ * they were under the cap. Only one call for a given session is ever
+ * in-flight at a time now, so every check sees the true, fully-committed
+ * total from every earlier call. Does NOT serialize across different
+ * sessions — those have independent caps and independent DB rows, so
+ * blocking them on each other would just be unnecessary latency.
+ *
+ * Returns false only if the wait budget is exhausted without acquiring —
+ * practically reachable only if a prior claim is neither released nor
+ * expired-and-stolen within `SLOT_ACQUIRE_MAX_WAIT_MS`, which itself already
+ * exceeds the staleness window.
+ */
+function acquireGenerationSlot(db: Database.Database, sessionId: string): boolean {
+  const deadline = Date.now() + SLOT_ACQUIRE_MAX_WAIT_MS;
+  while (true) {
+    if (tryClaimGenerationSlot(db, sessionId)) return true;
+    if (Date.now() >= deadline) return false;
+    sleepSync(SLOT_POLL_INTERVAL_MS);
+  }
+}
+
 // --- main entry point --------------------------------------------------------
 
 function recordMiss(
@@ -248,22 +312,51 @@ export function runGeneration(db: Database.Database, params: GenerationParams): 
   const { sessionId, significantFiles, config } = params;
   const diffSummary = buildDiffSummary(significantFiles);
 
-  const spentSoFar = getSessionCostUsd(db, sessionId);
-  if (spentSoFar >= config.costCapUsd) {
-    // Cap already met/exceeded — never invoke `claude -p` at all.
-    return recordMiss(db, params, diffSummary, "cap_reached", null);
+  // Serialize against every other call for this same session before even
+  // checking the caps — see acquireGenerationSlot's own comment for why
+  // this is what actually makes the checks below race-free, not just
+  // individually correct. A failure to acquire is logged as a timeout miss
+  // (not cap_reached — the cap itself was never actually evaluated).
+  if (!acquireGenerationSlot(db, sessionId)) {
+    return recordMiss(db, params, diffSummary, "timeout", null);
   }
 
-  const questionsSoFar = getSessionQuestionCount(db, sessionId);
-  if (questionsSoFar >= config.questionsPerSessionCap) {
-    // Same "never invoke claude -p at all" pattern as the cost cap above,
-    // and the same miss_reason — see DECISIONS.md's "Questions-per-session
-    // cap: miss-reason reuse" entry for why cap_reached is shared rather
-    // than a new value, and for how the two remain distinguishable after
-    // the fact from the session's own cost/question totals at the time.
-    return recordMiss(db, params, diffSummary, "cap_reached", null);
-  }
+  try {
+    const spentSoFar = getSessionCostUsd(db, sessionId);
+    if (spentSoFar >= config.costCapUsd) {
+      // Cap already met/exceeded — never invoke `claude -p` at all.
+      return recordMiss(db, params, diffSummary, "cap_reached", null);
+    }
 
+    const questionsSoFar = getSessionQuestionCount(db, sessionId);
+    if (questionsSoFar >= config.questionsPerSessionCap) {
+      // Same "never invoke claude -p at all" pattern as the cost cap above,
+      // and the same miss_reason — see DECISIONS.md's "Questions-per-session
+      // cap: miss-reason reuse" entry for why cap_reached is shared rather
+      // than a new value, and for how the two remain distinguishable after
+      // the fact from the session's own cost/question totals at the time.
+      return recordMiss(db, params, diffSummary, "cap_reached", null);
+    }
+
+    return runJudgeAndRecord(db, params, diffSummary);
+  } finally {
+    releaseGenerationSlot(db, sessionId);
+  }
+}
+
+/**
+ * The actual judge call + response handling, run only once the caller holds
+ * this session's generation slot and both caps have just been checked clear.
+ * Split out from `runGeneration` purely so that function's own control flow
+ * (acquire → check caps → generate → release) reads as one linear sequence
+ * instead of nesting this whole block inside the try.
+ */
+function runJudgeAndRecord(
+  db: Database.Database,
+  params: GenerationParams,
+  diffSummary: string
+): GenerationOutcome {
+  const { sessionId, significantFiles } = params;
   const answeredTags = getAllAnsweredConceptTags(db);
   const diffText = formatDiffForPrompt(significantFiles);
   const prompt = buildJudgePrompt(diffText, answeredTags);

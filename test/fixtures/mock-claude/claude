@@ -7,6 +7,17 @@ const fs = require("fs");
 
 const mode = process.env.GRASP_TEST_MOCK_MODE || "normal";
 
+// Optional artificial delay before responding, in ms — used by concurrency
+// regression tests that need each mock call to stay "in flight" long enough
+// for other racing processes to actually overlap it (see
+// test/generationCapRace.test.ts). A real synchronous sleep (Atomics.wait),
+// so it behaves like real generation latency rather than something this
+// single-threaded script could race past.
+const delayMs = parseInt(process.env.GRASP_TEST_MOCK_DELAY_MS || "0", 10);
+if (delayMs > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
+
 if (mode === "error") {
   process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: "", is_error: true }));
   process.exit(0);

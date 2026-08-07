@@ -105,6 +105,16 @@ const SCHEMA_SQL = `
     updated_at TEXT NOT NULL,
     PRIMARY KEY (session_id, repo)
   );
+
+  -- At most one open row per session_id: a mutex, not a log. Held for the
+  -- duration of one runGeneration call so the cap checks it does (cost +
+  -- question count) always see every EARLIER call's already-committed
+  -- result for this session, instead of racing them. See DECISIONS.md's
+  -- "Atomic cap enforcement: per-session generation reservation" entry.
+  CREATE TABLE IF NOT EXISTS generation_reservations (
+    session_id TEXT PRIMARY KEY,
+    claimed_at TEXT NOT NULL
+  );
 `;
 
 /**
@@ -646,6 +656,55 @@ export function getCapturedDiffsForTurn(
     filtered: Boolean(row.filtered),
     filterReason: row.filter_reason,
   }));
+}
+
+/**
+ * How long a claimed generation reservation is honored before a later
+ * claimer is allowed to steal it. Must exceed the generation subprocess's
+ * own timeout (`GENERATION_TIMEOUT_MS`, src/generation.ts) with real margin
+ * — this is what makes the reservation self-healing after a hook process
+ * that dies (killed session, machine sleep, etc.) mid-call instead of
+ * releasing normally, matching this codebase's existing self-heal posture
+ * for the checkpoint tables. Defined here (not in generation.ts) so store.ts
+ * has no dependency on generation.ts; generation.ts's own timeout constant
+ * is required by convention to stay comfortably under this value — see
+ * DECISIONS.md's reservation entry.
+ */
+export const GENERATION_RESERVATION_STALE_MS = 45_000;
+
+/**
+ * Attempts to claim the single generation slot for `sessionId`. Returns
+ * true if claimed (no other process holds it, or the holder's claim is
+ * older than `GENERATION_RESERVATION_STALE_MS` and gets stolen), false if
+ * another process currently holds a live claim. The read-check-write is one
+ * `BEGIN IMMEDIATE` transaction so two processes racing this call can't both
+ * see "no live claim" and both write — only the loser sees SQLite's own
+ * write-lock contention, not a logic race.
+ */
+export function tryClaimGenerationSlot(db: Database.Database, sessionId: string): boolean {
+  const run = db.transaction(() => {
+    const now = new Date();
+    const existing = db
+      .prepare(`SELECT claimed_at FROM generation_reservations WHERE session_id = ?`)
+      .get(sessionId) as { claimed_at: string } | undefined;
+    if (existing) {
+      const age = now.getTime() - new Date(existing.claimed_at).getTime();
+      if (age < GENERATION_RESERVATION_STALE_MS) {
+        return false;
+      }
+    }
+    db.prepare(
+      `INSERT INTO generation_reservations (session_id, claimed_at) VALUES (?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET claimed_at = excluded.claimed_at`
+    ).run(sessionId, now.toISOString());
+    return true;
+  });
+  return run.immediate();
+}
+
+/** Releases this session's generation slot, if held. Safe to call even if the slot was already stolen as stale (e.g. an unusually slow call) — just deletes whatever row is there, never asserts ownership by a token, since only one process is ever meant to legitimately hold it. */
+export function releaseGenerationSlot(db: Database.Database, sessionId: string): void {
+  db.prepare(`DELETE FROM generation_reservations WHERE session_id = ?`).run(sessionId);
 }
 
 /** Append-only audit row — every observed hook firing, regardless of what (if anything) it did. */

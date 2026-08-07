@@ -26,7 +26,7 @@ function readPackageVersion(): string {
   return pkg.version as string;
 }
 
-const HELP_TEXT = `grasp — gate AI-coding-agent output behind comprehension questions
+const HELP_TEXT = `grasp — comprehension questions about your AI coding agent's changes, answered on your own schedule in \`grasp review\` (with an optional hard gate on its next action)
 
 Usage:
   grasp --version                Print the installed version

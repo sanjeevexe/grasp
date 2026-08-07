@@ -63,6 +63,20 @@ function readJsonFile(filePath: string): unknown {
 
 const GATE_MODES = ["soft", "hard"] as const;
 
+const KNOWN_TOP_LEVEL_KEYS = [
+  "gateMode",
+  "costCapUsd",
+  "ignorePatterns",
+  "questionsPerSessionCap",
+  "diffThresholds",
+] as const;
+
+const KNOWN_DIFF_THRESHOLD_KEYS = [
+  "minChangedLines",
+  "maxTotalChangedLines",
+  "maxSingleFileChangedLines",
+] as const;
+
 /**
  * Validates the *shape* of an override object read from a config file —
  * each key present must have the right type/enum/range, not just be valid
@@ -87,6 +101,25 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
   }
 
   const errors: string[] = [];
+
+  // Found by an independent test pass: a typo'd key (e.g. "gateMod" instead
+  // of "gateMode") was silently accepted and ignored — `deepMerge` only ever
+  // reads keys it recognizes off the override object, so a misspelled cap,
+  // threshold, or gate-mode key left the user believing their override took
+  // effect (it's sitting right there in the file they wrote) while Grasp
+  // silently kept running on the default. That's a safety-relevant silent
+  // failure specifically for `gateMode`/the cap fields, not just a cosmetic
+  // one, so unknown keys are rejected here with the same "throw a clear
+  // error, never silently ignore" posture as every other validation in this
+  // function, rather than merely warned about. See DECISIONS.md's "Unknown
+  // config keys are rejected, not silently ignored" entry.
+  for (const key of Object.keys(value)) {
+    if (!(KNOWN_TOP_LEVEL_KEYS as readonly string[]).includes(key)) {
+      errors.push(
+        `unknown config key ${JSON.stringify(key)} (did you mean one of: ${KNOWN_TOP_LEVEL_KEYS.join(", ")}?)`
+      );
+    }
+  }
 
   if (value.gateMode !== undefined && !GATE_MODES.includes(value.gateMode as any)) {
     errors.push(`gateMode must be one of ${GATE_MODES.map((m) => `"${m}"`).join(" | ")}, got ${JSON.stringify(value.gateMode)}`);
@@ -115,7 +148,14 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
     if (!isPlainObject(value.diffThresholds)) {
       errors.push(`diffThresholds must be an object, got ${JSON.stringify(value.diffThresholds)}`);
     } else {
-      for (const key of ["minChangedLines", "maxTotalChangedLines", "maxSingleFileChangedLines"] as const) {
+      for (const key of Object.keys(value.diffThresholds)) {
+        if (!(KNOWN_DIFF_THRESHOLD_KEYS as readonly string[]).includes(key)) {
+          errors.push(
+            `unknown diffThresholds key ${JSON.stringify(key)} (did you mean one of: ${KNOWN_DIFF_THRESHOLD_KEYS.join(", ")}?)`
+          );
+        }
+      }
+      for (const key of KNOWN_DIFF_THRESHOLD_KEYS) {
         const fieldValue = (value.diffThresholds as Record<string, unknown>)[key];
         if (fieldValue === undefined) continue;
         if (typeof fieldValue !== "number" || !Number.isFinite(fieldValue) || fieldValue < 0) {

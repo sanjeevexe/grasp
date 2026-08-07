@@ -134,6 +134,40 @@ test("isFileGenerated: false when the marker text only appears deep in the file,
   assert.equal(isFileGenerated(f), false);
 });
 
+// Regression coverage for a bug an independent test pass found: an ordinary
+// hunk deep in an EXISTING file, whose first added line happens to contain
+// generated-file marker text incidentally (not as a generator's header
+// comment), used to be misclassified as `generated_file` purely because it
+// was the first hunk in the diff — the old check looked at the first 5
+// added lines of the DIFF, not the first 5 lines of the resulting FILE.
+
+test("isFileGenerated: false for an ordinary hunk deep in an existing file, even if its first added line contains marker text", () => {
+  const f = diffFile({
+    path: "src/vault.ts",
+    insertions: 3,
+    deletions: 1,
+    hunks: [
+      hunk("@@ -95,10 +100,10 @@", [
+        " function readState() {",
+        '-  return state;',
+        '+  throw new Error("Do not edit locked state");',
+        "+  return state;",
+      ]),
+    ],
+  });
+  assert.equal(isFileGenerated(f), false);
+});
+
+test("isFileGenerated: true when the marker is in the first hunk's early NEW-file lines (real header case still detected)", () => {
+  const f = diffFile({
+    path: "src/api.generated.ts",
+    insertions: 3,
+    deletions: 0,
+    hunks: [hunk("@@ -0,0 +1,3 @@", ["+// @generated", "+export interface Foo {}", "+export interface Bar {}"])],
+  });
+  assert.equal(isFileGenerated(f), true);
+});
+
 // --- evaluateCapturedDiff --------------------------------------------------
 
 function bigHunk(prefix: "+" | "-", n: number) {

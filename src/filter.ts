@@ -93,21 +93,67 @@ const GENERATED_FILE_MARKERS: RegExp[] = [
 ];
 
 /**
- * True if any of the first few added lines of a file's diff declare it
- * generated. Checking only the added lines (not context/removed lines)
- * means this only fires on content the diff itself is introducing or
- * confirming is present — and checking only the first handful of lines
- * matches where these markers conventionally live (a header comment),
- * keeping this cheap and avoiding false positives from the word
- * "generated" appearing incidentally deep in a large diff.
+ * How many lines from the top of the NEW file a generated-file marker has
+ * to appear within to count. These markers conventionally live in a header
+ * comment at the very top of a file (see e.g. the protoc-gen-ts example
+ * above) — this is a position-in-the-FILE check, not a position-in-the-diff
+ * one; see `isFileGenerated`'s own comment for why that distinction matters.
+ */
+const GENERATED_FILE_HEADER_LINE_LIMIT = 5;
+
+/** Extracts the new-file starting line number `c` from a hunk header of the form `@@ -a[,b] +c[,d] @@`. Returns null if the header doesn't match the expected shape. */
+function parseHunkNewFileStartLine(header: string): number | null {
+  const match = header.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * True if a generated-file marker appears among the diff's added lines
+ * AND that line falls within the first `GENERATED_FILE_HEADER_LINE_LIMIT`
+ * lines of the resulting NEW file — not merely within the first few added
+ * lines of whichever hunk happens to appear first in the diff.
+ *
+ * Originally implemented as "check the first 5 added lines of the diff,
+ * wherever they fall" — found by an independent test pass to be a broad
+ * false positive: an ordinary hunk touching, say, line 100 of an existing
+ * file (e.g. `throw new Error("Do not edit locked state")`, a normal
+ * runtime guard, not a generator's header comment) was misclassified as
+ * `generated_file` and its entire otherwise-meaningful change silently
+ * discarded, purely because it happened to be the first hunk in that
+ * particular diff. The actual convention these markers rely on (protobuf/
+ * gRPC, OpenAPI, ORMs, `git` itself) is a comment at the top of the FILE,
+ * not the top of whatever diff happens to touch it — so this now tracks
+ * each hunk's own new-file line numbers (from its `@@ -a,b +c,d @@` header)
+ * while walking its lines, and only tests a marker against lines whose
+ * real position in the resulting file is within the header window. A hunk
+ * whose header start is already past that window is skipped entirely
+ * without inspecting its content, so a change deep in an existing file can
+ * never trigger this regardless of what its first few added lines say.
  */
 export function isFileGenerated(file: DiffFile): boolean {
-  const addedLines = file.hunks
-    .flatMap((h) => h.lines)
-    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-    .map((l) => l.slice(1))
-    .slice(0, 5);
-  return addedLines.some((line) => GENERATED_FILE_MARKERS.some((re) => re.test(line)));
+  for (const h of file.hunks) {
+    const startLine = parseHunkNewFileStartLine(h.header);
+    if (startLine === null || startLine > GENERATED_FILE_HEADER_LINE_LIMIT) continue;
+
+    let lineNo = startLine;
+    for (const line of h.lines) {
+      if (line.startsWith("+") && !line.startsWith("+++")) {
+        if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT) {
+          const content = line.slice(1);
+          if (GENERATED_FILE_MARKERS.some((re) => re.test(content))) return true;
+        }
+        lineNo++;
+      } else if (line.startsWith("-") && !line.startsWith("---")) {
+        // Removed lines don't exist in the new file — they don't advance
+        // the new-file line counter.
+      } else {
+        // Context line: present in both old and new file, advances the
+        // new-file counter too.
+        lineNo++;
+      }
+    }
+  }
+  return false;
 }
 
 // --- Formatting-only detection ------------------------------------------
