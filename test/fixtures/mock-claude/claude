@@ -7,6 +7,17 @@ const fs = require("fs");
 
 const mode = process.env.GRASP_TEST_MOCK_MODE || "normal";
 
+// Optional argv capture — used by generation.test.ts to assert exactly which
+// isolation flags invokeClaudeJudge actually invoked `claude` with (a
+// regression guard for the `--allowedTools ""` vs `--tools "" --safe-mode
+// --setting-sources "" --strict-mcp-config` privacy bug an independent test
+// pass found; see DECISIONS.md's "Generation call tool/context isolation
+// flags" entry).
+const argvLogPath = process.env.GRASP_TEST_MOCK_ARGV_LOG;
+if (argvLogPath) {
+  fs.writeFileSync(argvLogPath, JSON.stringify(process.argv.slice(2)));
+}
+
 // Optional artificial delay before responding, in ms — used by concurrency
 // regression tests that need each mock call to stay "in flight" long enough
 // for other racing processes to actually overlap it (see

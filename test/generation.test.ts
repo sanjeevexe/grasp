@@ -180,6 +180,36 @@ test("runGeneration: a brand-new concept tag with no concept question is rejecte
   db.close();
 });
 
+// Regression coverage for a release-blocking privacy bug an independent test
+// pass found: `--allowedTools ""` only extends Claude Code's tool
+// allow-list — it does not disable the built-in tool set, and does nothing
+// to stop a nested `claude -p` call from loading the calling repo's
+// CLAUDE.md/skills/plugins/hooks/MCP config or a user's own pre-existing
+// tool allow-rules. Asserts the actual argv invokeClaudeJudge shells out
+// with, so a future accidental revert to `--allowedTools ""` fails a test
+// instead of silently shipping. See DECISIONS.md's "Generation call
+// tool/context isolation flags" entry.
+test("runGeneration: invokes claude with real tool/context isolation flags, not the old ineffective --allowedTools \"\"", () => {
+  const db = openStore(tempDbPath());
+  const params = baseParams();
+  const argvLogPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "grasp-test-argv-")), "argv.json");
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_ARGV_LOG: argvLogPath }, () => {
+    runGeneration(db, params);
+  });
+
+  const argv: string[] = JSON.parse(fs.readFileSync(argvLogPath, "utf-8"));
+  assert.ok(argv.includes("--tools"), "must disable all built-in tools via --tools");
+  assert.equal(argv[argv.indexOf("--tools") + 1], "", "--tools must be passed an empty string to disable everything");
+  assert.ok(argv.includes("--safe-mode"), "must disable CLAUDE.md/skills/plugins/hooks/MCP loading via --safe-mode");
+  assert.ok(argv.includes("--setting-sources"), "must exclude user/project/local settings via --setting-sources");
+  assert.equal(argv[argv.indexOf("--setting-sources") + 1], "");
+  assert.ok(argv.includes("--strict-mcp-config"), "must reject any MCP config as defense-in-depth");
+  assert.ok(!argv.includes("--allowedTools"), "must not use the ineffective --allowedTools flag");
+
+  db.close();
+});
+
 test("runGeneration: the SAME response shape is accepted once the concept is already answered (no violation)", () => {
   const db = openStore(tempDbPath());
   // Pre-seed the concept tag as already answered via a prior event.
