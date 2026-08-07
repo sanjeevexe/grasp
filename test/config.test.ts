@@ -99,3 +99,73 @@ test("loadConfig: two different repos under the same global config get independe
   assert.deepEqual(loadedA.config.ignorePatterns, ["only-in-a/"]);
   assert.deepEqual(loadedB.config.ignorePatterns, []);
 });
+
+// --- Config schema validation ------------------------------------------
+//
+// Regression coverage for a bug an independent test pass found: a
+// syntactically valid config with the WRONG field type (e.g.
+// `"ignorePatterns": "scripts/"`, a string instead of an array) used to
+// pass straight through to `Array.prototype.some` deep inside the filter
+// and crash there — well past the point of a clear, attributable error,
+// and (before the checkpoint-claim rewrite) after a diff-losing checkpoint
+// advance had already happened. loadConfig now validates each present
+// key's type/enum/range at load time, the same "throw a clear error, never
+// silently coerce" policy already used for malformed JSON.
+
+function repoWithConfig(overrideJson: string): string {
+  const repoRoot = mkTempDir("grasp-test-repo-");
+  fs.writeFileSync(path.join(repoRoot, ".grasp.json"), overrideJson, "utf-8");
+  return repoRoot;
+}
+
+test("loadConfig: rejects ignorePatterns of the wrong type instead of crashing downstream", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ ignorePatterns: "scripts/" }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /ignorePatterns must be an array of strings/);
+});
+
+test("loadConfig: rejects an invalid gateMode value instead of silently treating it as soft", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ gateMode: "hadr" }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /gateMode must be one of/);
+});
+
+test("loadConfig: rejects a negative costCapUsd", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ costCapUsd: -1 }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /costCapUsd must be a non-negative number/);
+});
+
+test("loadConfig: rejects a non-integer questionsPerSessionCap", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ questionsPerSessionCap: 2.5 }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /questionsPerSessionCap must be a positive integer/);
+});
+
+test("loadConfig: rejects a malformed diffThresholds field", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(JSON.stringify({ diffThresholds: { minChangedLines: "three" } }));
+  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /diffThresholds\.minChangedLines must be a non-negative number/);
+});
+
+test("loadConfig: a fully valid override with every key set still passes", () => {
+  const graspHome = mkTempDir("grasp-test-home-");
+  const globalConfigPath = path.join(graspHome, "config.json");
+  const repoRoot = repoWithConfig(
+    JSON.stringify({
+      gateMode: "hard",
+      costCapUsd: 0.5,
+      ignorePatterns: ["a/", "b.txt"],
+      questionsPerSessionCap: 3,
+      diffThresholds: { minChangedLines: 1, maxTotalChangedLines: 100, maxSingleFileChangedLines: 50 },
+    })
+  );
+  const loaded = loadConfig(repoRoot, globalConfigPath, graspHome);
+  assert.equal(loaded.config.gateMode, "hard");
+  assert.equal(loaded.config.questionsPerSessionCap, 3);
+});

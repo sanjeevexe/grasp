@@ -20,6 +20,32 @@ if (mode === "bad-json-result") {
   process.exit(0);
 }
 
+if (mode === "brand-new-concept-no-question") {
+  // Contract violation: worthAsking=true for a concept tag the caller has
+  // never seen answered before, but questionConcept is null anyway — used
+  // by test/generation.test.ts to prove Grasp enforces concept-first
+  // deterministically rather than trusting the model's self-report.
+  const result = {
+    worthAsking: true,
+    conceptTag: "brand-new-concept",
+    questionConcept: null,
+    questionInstance: "instance question with no concept question first",
+  };
+  process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.stringify(result), is_error: false }));
+  process.exit(0);
+}
+
+if (mode === "invalid-tag-format") {
+  const result = {
+    worthAsking: true,
+    conceptTag: "Not Kebab Case!",
+    questionConcept: "concept q",
+    questionInstance: "instance q",
+  };
+  process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.stringify(result), is_error: false }));
+  process.exit(0);
+}
+
 if (mode === "missing-cost") {
   const result = {
     worthAsking: true,

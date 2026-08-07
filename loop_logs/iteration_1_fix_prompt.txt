@@ -1,3 +1,18 @@
+You are Claude Code working autonomously and unattended in the Grasp project folder (no human will respond to questions this run -- make reasonable judgment calls yourself and log them to DECISIONS.md as usual, per this project's standing instruction in ./CLAUDE.md).
+
+Read grasp-project-brief.md, BUILD_PLAN.md, and DECISIONS.md fresh from disk for context. Then read CODEX_TEST_REPORT.md (pasted below this template, if one exists yet) -- it is an independent AI reviewer's test report on the current state of the build. Your job this run:
+
+1. Fix every issue the report flags as broken, risky, or a real bug. Use your own engineering judgment on implementation details, but stay within the scope of what the brief and BUILD_PLAN.md actually call for -- do not add features from the brief's deferred table (Section 4).
+2. For any fix that involves a real design choice (more than one reasonable way to do it), log it to DECISIONS.md with your reasoning, per the standing instruction.
+3. Actually verify each fix yourself before considering it done -- reproduce the original bug scenario the report describes, confirm it's actually gone, don't just assert it from reading the code.
+4. Do not regress anything that was previously working. If you're not sure something still works, check it.
+5. If the report is empty, missing, or says everything already passed, do a fresh critical read of the codebase yourself looking for anything a careful reviewer would flag, and fix what you find.
+
+Do not ask clarifying questions -- this is an unattended run. If something is genuinely ambiguous, make the most conservative, brief-aligned choice, log it as a decision, and continue.
+
+When you're done, make sure the codebase builds and typechecks cleanly.
+
+--- Latest CODEX_TEST_REPORT.md (fix what this flags) ---
 # Codex independent test report
 
 ## Summary

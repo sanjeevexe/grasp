@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildDiffSummary, isTimeoutError, parseJudgeResponse } from "../src/generation";
-import { diffFile } from "./helpers";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { buildDiffSummary, isTimeoutError, parseJudgeResponse, runGeneration, GenerationParams } from "../src/generation";
+import { openStore, getConceptTagGlobal } from "../src/store";
+import { diffFile, testConfig } from "./helpers";
 
 // --- parseJudgeResponse: the judge+generate response contract -------------
 
@@ -75,6 +79,120 @@ test("parseJudgeResponse: rejects a response missing worthAsking entirely", () =
 
 test("parseJudgeResponse: rejects a bare JSON array (not an object)", () => {
   assert.equal(parseJudgeResponse("[]"), null);
+});
+
+test("parseJudgeResponse: rejects a conceptTag that isn't kebab-case", () => {
+  // Regression test: memoization is a plain string match against
+  // previously-stored tags, so a differently-formatted tag for the same
+  // concept (wrong case, spaces, punctuation) would silently defeat it.
+  // Found by an independent test pass.
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "Not Kebab Case!",
+    questionConcept: "x",
+    questionInstance: "y",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: accepts a multi-word kebab-case conceptTag", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "mutex-vs-channel-2",
+    questionConcept: "x",
+    questionInstance: "y",
+  });
+  assert.equal(parseJudgeResponse(raw)?.conceptTag, "mutex-vs-channel-2");
+});
+
+// --- runGeneration: concept-first enforcement -----------------------------
+//
+// Regression coverage for a bug an independent test pass found: a mock
+// response for a never-before-answered concept tag, with no concept
+// question, used to be accepted as a successful instance-only event — that
+// would let the concept get marked "answered" the moment the instance
+// question was answered, without the concept question ever having been
+// asked. Grasp must reject this deterministically rather than trust the
+// model's self-report.
+
+const FIXTURE_CLAUDE_DIR = path.resolve(process.cwd(), "test/fixtures/mock-claude");
+
+function withMockClaude(env: Record<string, string>, fn: () => void): void {
+  const originalPath = process.env.PATH;
+  const originalEnv: Record<string, string | undefined> = {};
+  for (const key of Object.keys(env)) originalEnv[key] = process.env[key];
+  process.env.PATH = `${FIXTURE_CLAUDE_DIR}:${originalPath}`;
+  Object.assign(process.env, env);
+  try {
+    fn();
+  } finally {
+    process.env.PATH = originalPath;
+    for (const key of Object.keys(env)) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  }
+}
+
+function tempDbPath(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grasp-test-gen-db-"));
+  return path.join(dir, "history.db");
+}
+
+function baseParams(overrides: Partial<GenerationParams> = {}): GenerationParams {
+  return {
+    sessionId: "test-session",
+    repo: "/tmp/test-repo",
+    significantFiles: [diffFile({ path: "a.ts", insertions: 10, deletions: 2 })],
+    config: testConfig(),
+    diffHash: null,
+    ...overrides,
+  };
+}
+
+test("runGeneration: a brand-new concept tag with no concept question is rejected as malformed, not accepted", () => {
+  const db = openStore(tempDbPath());
+  const params = baseParams();
+  let outcome: ReturnType<typeof runGeneration> | undefined;
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
+    outcome = runGeneration(db, params);
+  });
+
+  assert.equal(outcome!.missReason, "error", "must be recorded as a miss, never a silent instance-only success");
+  assert.equal(outcome!.questionType, null);
+
+  const row = db.prepare("SELECT question_type, cost_usd FROM events WHERE id = ?").get(outcome!.eventId) as any;
+  assert.equal(row.question_type, null);
+  assert.equal(row.cost_usd, 0.001, "the call still cost money and that cost must still be recorded");
+
+  // The concept must NOT be memoized as taught — nothing should be
+  // learnable about "brand-new-concept" from this rejected event.
+  const tagRows = getConceptTagGlobal(db, "brand-new-concept", false);
+  assert.equal(tagRows.length, 0);
+  db.close();
+});
+
+test("runGeneration: the SAME response shape is accepted once the concept is already answered (no violation)", () => {
+  const db = openStore(tempDbPath());
+  // Pre-seed the concept tag as already answered via a prior event.
+  db.exec(`
+    INSERT INTO events (timestamp, repo, session_id, question_type, generation_source)
+    VALUES ('2020-01-01T00:00:00.000Z', '/tmp/test-repo', 'prior-session', 'both', 'test-seed');
+  `);
+  const eventId = db.prepare(`SELECT id FROM events WHERE session_id = 'prior-session'`).get() as { id: number };
+  db.prepare(`INSERT INTO concept_tags (event_id, tag, answered) VALUES (?, 'brand-new-concept', 1)`).run(eventId.id);
+
+  const params = baseParams();
+  let outcome: ReturnType<typeof runGeneration> | undefined;
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
+    outcome = runGeneration(db, params);
+  });
+
+  assert.equal(outcome!.missReason, null);
+  assert.equal(outcome!.questionType, "instance");
+  db.close();
 });
 
 // --- isTimeoutError ---------------------------------------------------------

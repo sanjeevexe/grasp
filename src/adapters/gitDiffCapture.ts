@@ -40,6 +40,32 @@ function parseNameStatus(output: string): NameStatusEntry[] {
     });
 }
 
+/**
+ * Resolves a `git diff --numstat` path field to the file's new/current
+ * path. Git renders a rename two different ways depending on how much
+ * prefix/suffix the old and new paths share:
+ *   - No shared prefix/suffix: the full paths, e.g. "old/path.ts => new/path.ts".
+ *   - A shared prefix/suffix: a compact brace form, e.g.
+ *     "src/{old-name.ts => new-name.ts}" or "common/{old => new}/rest.ts" —
+ *     git elides the unchanged parts and only spells out what differs
+ *     inside `{...}`.
+ * The naive `pathField.split(" => ")[1]` only handles the first form — on
+ * the brace form it returns a fragment like "new-name.ts}" (trailing brace,
+ * missing the "src/" prefix), which then fails to match the file's real
+ * path from `--name-status` and silently drops its insertion/deletion
+ * counts to 0. Found by an independent test pass: a genuinely edited
+ * rename (not just moved) was recorded as +0/-0 and filtered out as if it
+ * were empty. See DECISIONS.md's "Compact rename numstat parsing" entry.
+ */
+export function resolveNumstatNewPath(pathField: string): string {
+  const braceMatch = pathField.match(/^(.*)\{.* => (.*)\}(.*)$/);
+  if (braceMatch) {
+    const [, prefix, newPart, suffix] = braceMatch;
+    return `${prefix}${newPart}${suffix}`;
+  }
+  return pathField.includes(" => ") ? pathField.split(" => ")[1] : pathField;
+}
+
 /** Parses `git diff --numstat -M` output, keyed by the file's new/current path. */
 function parseNumstat(output: string): Map<string, NumstatEntry> {
   const map = new Map<string, NumstatEntry>();
@@ -50,7 +76,7 @@ function parseNumstat(output: string): Map<string, NumstatEntry> {
     // Binary files report "-" instead of a count.
     const insertions = insRaw === "-" ? 0 : Number(insRaw);
     const deletions = delRaw === "-" ? 0 : Number(delRaw);
-    const newPath = pathField.includes(" => ") ? pathField.split(" => ")[1] : pathField;
+    const newPath = resolveNumstatNewPath(pathField);
     map.set(newPath, { insertions, deletions });
   }
   return map;

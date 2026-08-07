@@ -1,0 +1,153 @@
+# Codex independent test report
+
+## Summary
+
+Grasp builds and runs, and most of its end-to-end pipeline is real: it captures incremental changes, filters many mechanical changes, calls the expected Claude command, stores questions and costs, presents a usable terminal review screen, saves answers and skips, and enforces session-wide gates and limits.
+
+This run still found release-blocking defects. In particular:
+
+1. A renamed file with real edits can be counted as zero changed lines and filtered out, so the user gets no question about it.
+2. A common formatter rewrite that wraps one line across several lines is treated as meaningful even though the README says formatting-only changes are excluded.
+3. Generated files are not generally detected; an obvious `api.generated.ts` file with an “AUTO-GENERATED” header passed the filter.
+4. A repository-root `.grasp.json` is ignored when Claude Code is started from a subdirectory, allowing generation even when that repository configured a zero cost/question cap and ignored the changed file.
+5. Grasp accepts an instance-only model response for a concept the user has never answered, contrary to the project’s core concept-first teaching design.
+
+Because these issues can cause missed learning prompts, unnecessary usage, or ignored safety settings, I would not rely on this version for real work yet.
+
+### Test environment and isolation
+
+- Node: `v26.5.1`; npm: `11.17.0`.
+- `npm install`, `npm run build`, `grasp --version`, and `grasp --help` all succeeded. Version output was `0.1.0`.
+- The automated suite passed all 51 tests.
+- The installed real `claude` executable reported `loggedIn: false` under the isolated test home, so generation tests used a controlled mock executable named `claude`, following the project’s established test pattern.
+- Hook behavior was tested by sending documented hook payloads to `grasp internal:hook`. A live authenticated Claude Code session was therefore not available to confirm Claude Code’s interpretation of the hook output.
+- Every Grasp command used `/private/tmp/grasp-codex-test.MuStu4` as `HOME`, with repositories below its `scratch/` directory. The developer’s real `~/.grasp/history.db` was not read or modified.
+
+## 1. Build, automated tests, and basic CLI — PASS
+
+`npm install` completed, TypeScript compiled successfully, and the built command printed both version and help output. The first isolated run created the documented default config and SQLite history database under the scratch home.
+
+The 51 automated tests all passed, including filter rules, config merging, cost and question limits, malformed model responses, missing cost handling, and concurrent database writers. The additional failures in this report are gaps not covered by that suite, not failures already exposed by it.
+
+## 2. Diff capture and mechanical filtering — FAIL
+
+### What worked
+
+- A meaningful validation change was captured with the correct file, changed lines, and code context.
+- Hook capture used checkpoints correctly. A one-line change was recorded as below the minimum, a repeated `PostToolUse` with no new change produced no duplicate capture or paid question, and a later three-line change produced exactly one question.
+- Pre-existing uncommitted work was treated as the session’s starting point rather than being attributed to the later agent action.
+- Untracked files were captured.
+- `package-lock.json`, `.grasp.json`, and `.claude/settings.local.json` were excluded.
+- A repository-specific exact ignore rule excluded the configured file when Grasp ran from the repository root.
+
+### What is broken
+
+**Edited renames can be filtered out incorrectly.** In a real git repository, git reported a staged rename with two inserted and two deleted lines:
+
+`R066 src/old-name.ts src/new-name.ts` and `2 2 src/{old-name.ts => new-name.ts}`.
+
+Grasp reported the rename itself but recorded `+0/-0`, then rejected it as below the three-line minimum. The parser does not correctly match git’s compact rename path in the line-count output back to the new filename. The hook’s checkpoint path uses the same parser, so this can suppress questions during normal use, not just in the debug command.
+
+**Common formatting-only changes pass.** Wrapping this one line:
+
+`buildSummary(first, second, third)`
+
+onto five lines was reported as six changed lines and passed as meaningful. Grasp’s formatting check only handles cases where removed and added lines match one-for-one after whitespace is collapsed. Normal formatter behavior often changes the number of lines, so the README’s broad claim that formatting-only changes are excluded is not true.
+
+**Generated-file filtering is incomplete.** An untracked `src/api.generated.ts` containing an explicit “AUTO-GENERATED FILE. DO NOT EDIT.” header passed as a significant six-line change. Grasp ignores a few known directories and lockfiles, but it has no general generated-file detection despite the brief and README claiming generated files are excluded.
+
+## 3. Question generation and concept memoization — FAIL
+
+### What worked
+
+- Grasp invoked exactly one command with the required shape: `claude -p <prompt> --output-format json --allowedTools "" --max-turns 1`.
+- The prompt included only files that survived filtering and included the global list of answered concept tags.
+- A controlled concept question and instance question were saved in the intended order and formed a sensible pair.
+- After `validation-boundaries` was answered, a later event with the same tag became instance-only even though the mock returned another concept question. This proves Grasp independently enforces cross-repository memoization instead of trusting the model alone.
+- Error envelopes, invalid outer JSON, nonzero exits, and missing cost data were rejected and logged rather than becoming questions.
+
+### What is broken
+
+For a brand-new tag that had never been answered, the mock returned `questionConcept: null` plus an instance question. Grasp accepted it as a successful instance-only event instead of rejecting the response. That directly violates the project’s central rule that a new concept must be taught or tested before its application is asked.
+
+The response parser also accepted the tag `Not Kebab Case!` even though its own contract requires short kebab-case tags. Inconsistent tags weaken the “do not teach this concept again” behavior because equivalent concepts will not reliably match in history.
+
+Because no authenticated real Claude CLI was available, this run could verify command shape, prompt contents, parsing, storage, and memoization, but not the quality of current real-Claude questions.
+
+## 4. Cost cap and question-count cap — PASS
+
+Both limits accumulated across a whole Claude Code session rather than resetting for each prompt turn.
+
+- With the question cap set to 1, turn 1 produced one real question. Turn 2 under the same `session_id` did not call the mock and logged `cap_reached`.
+- With the cost cap set to `$0.015` and the mock reporting `$0.01` per call, turns 1 and 2 ran, bringing known spend to `$0.02`; turn 3 did not call the mock and logged `cap_reached`.
+- Independent mock logs confirmed one invocation in the question-cap test and two in the cost-cap test.
+- Cost and question counts did not reset when `prompt_id` changed.
+
+The cost limit is checked before a call using spend already known, so one final call can take the total above the configured value. The documentation’s wording that Grasp stops once the cap has been hit matches this behavior, but users should not read the setting as a strict never-exceed dollar ceiling.
+
+## 5. `grasp review` answer and skip flow — PASS
+
+The review UI was exercised in a real pseudo-terminal, not just by calling database functions.
+
+- It showed the repository, mechanical summary, stored code change, and concept question before the instance question.
+- Pressing Enter with an empty concept answer did nothing. The event remained unanswered, the concept remained unlearned, and the UI displayed a clear message requiring text or an explicit skip.
+- A real concept answer followed by a real instance answer was stored, and the linked concept tag was marked answered.
+- Escape did not silently discard a question. It opened the optional skip-reason step, and a second deliberate Enter was required to complete a reasonless skip.
+- The skipped event was stored with `skipped = 1` and was removed from the pending queue.
+- A six-question queue spanning five sessions showed clear overall and per-session batch counts, with questions from the same session grouped together.
+
+## 6. Soft and hard gate modes — PASS (SIMULATED HOOKS)
+
+- Soft mode produced no deny output for a session with a pending question.
+- Hard mode returned the documented `PreToolUse` deny object for the session that created the pending question.
+- Another session was not blocked by that question.
+- Answering the question immediately removed the hard gate.
+- Explicitly skipping a different question also immediately removed that session’s hard gate.
+- A `Stop` event with one pending question and `$0.01` spend emitted one combined message containing the correct pending count and `$0.0100` cumulative cost.
+
+This confirms Grasp’s decision logic and emitted JSON. It does not replace a live authenticated Claude Code test of how the current CLI consumes that JSON.
+
+## 7. Failure and timeout handling — PASS
+
+- A mock process exiting with status 7 logged `miss_reason = 'error'`, created no question, and left the hook exit successful.
+- A Claude-style `is_error: true` envelope logged `error` and preserved its reported `$0.002` cost.
+- Invalid outer JSON logged `error` without crashing the hook.
+- A hanging mock was terminated after 20 seconds and logged `miss_reason = 'timeout'`.
+- None of these failures created a pending question, and hard mode did not gate the failed session on a nonexistent question.
+
+## 8. Config loading and repository overrides — FAIL
+
+### What worked
+
+- The isolated global config was created with the documented defaults.
+- Repository values overrode global values when Grasp ran from the repository root.
+- Nested threshold objects merged key by key, while arrays replaced the global array, matching the decision log.
+- Malformed JSON caused a clear nonzero error, named the broken file, and did not overwrite it.
+
+### What is broken
+
+**Repository-root overrides disappear from subdirectories.** I placed a `.grasp.json` at the git repository root with a zero cost cap, zero question cap, and `app.ts` ignored. I then simulated hooks with `cwd` set to a subdirectory of that repository. Grasp invoked the mock anyway, generated a question about `app.ts`, and stored the repository as the subdirectory path. The code only looks for `.grasp.json` in the exact working directory and does not resolve the git root. This conflicts with the README’s promise of a per-repository file “in that repo’s root” and can bypass the user’s cost and filtering settings.
+
+**Valid JSON is not validated against the expected setting types.** A config containing `"ignorePatterns": "scripts/"` loaded successfully and later failed with the internal message `config.ignorePatterns.some is not a function`. In hook mode that exception is swallowed so the agent is not blocked, which means a simple config typo can silently disable capture or generation. Invalid gate names, negative caps, and wrong number types are likewise not rejected at load time.
+
+## 9. Fresh-eyes code and documentation review — FAIL
+
+The code is generally readable, well commented, and careful about database writes and subprocess failures. The README is also much clearer than the previous test report described: it now accurately explains on-demand `grasp review`, next-tool hard gating, strict JSON, plain ignore matching, event-based question caps, and the shared `cap_reached` reason.
+
+Material inconsistencies remain:
+
+- “Formatting-only changes” are described as excluded without explaining that only simple one-for-one whitespace rewrites are detected.
+- “Generated files” are described as excluded, but there is no general generated-file rule.
+- Per-repository config is described as living at the repository root, but Grasp does not find it when invoked below that root.
+- The question response contract says new concepts require a concept question and tags must be kebab-case, but the implementation accepts violations of both rules.
+- `DECISIONS.md` explicitly records exact-working-directory config lookup, while the user-facing README describes repository-root behavior. The implementation decision and product documentation disagree.
+
+## Additional bugs and risks found
+
+1. **Edited rename statistics are lost.** This is the most direct capture defect: actual `+2/-2` rename edits become `+0/-0`, leading to a false “too small” decision.
+2. **The fallback one-shot capture cannot recognize an unstaged rename.** Because untracked additions are collected separately from tracked deletions, an unstaged move appears as one deleted file plus one added file. Counts and content remain visible, so this is less severe than the zero-count bug, but the recorded status is misleading.
+3. **Concept-tag format is not enforced.** Model variation in punctuation or capitalization can cause concepts to be taught repeatedly under slightly different tags.
+4. **Cost caps are stop-after-hit limits.** A single call can overshoot the configured amount because its cost is only known afterward. This is understandable technically but worth making more explicit near the setting.
+5. **Live Claude compatibility remains unverified in this environment.** The mock proves Grasp’s side of the contract, but an authenticated end-to-end Claude Code run is still needed before release.
+
+FINAL_VERDICT: FAIL

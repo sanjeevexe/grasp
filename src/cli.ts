@@ -4,8 +4,10 @@ import * as path from "path";
 import { ClaudeCodeAdapter, ClaudeCodeHookPayload, resolvePromptId } from "./adapters/claudeCodeAdapter";
 import { GitDiffAdapter } from "./adapters/gitDiffCapture";
 import { loadConfig } from "./config";
+import { resolveRepoRoot } from "./git";
 import { evaluateCapturedDiff } from "./filter";
 import {
+  getBlockingPendingQuestionsForSession,
   getConceptTagsByEventId,
   getEventById,
   getPendingQuestionsForSession,
@@ -64,7 +66,7 @@ function ensureInitialized(repoRoot: string) {
 }
 
 function runDebugSeed(): void {
-  const repoRoot = process.cwd();
+  const repoRoot = resolveRepoRoot(process.cwd());
   const { config, globalConfigPath, repoConfigPath } = loadConfig(repoRoot);
   const db = openStore();
 
@@ -278,13 +280,22 @@ async function runInternalHook(): Promise<void> {
   }
 
   const promptId = resolvePromptId(payload);
+  // Resolved once per firing, not per hook-event branch: Claude Code's own
+  // `cwd` for a session is wherever the user happened to launch it from,
+  // which is often a subdirectory of the actual repo (e.g. `cd src &&
+  // claude`). Config overrides, checkpoints, and the hard-gate check all
+  // need to key off the repo ROOT consistently, or a repo's `.grasp.json`
+  // (gate mode, caps, ignore patterns) silently stops applying the moment
+  // someone's session cwd isn't the exact repo root — see DECISIONS.md's
+  // "Repo-root resolution" entry for the bug this fixes.
+  const repoRoot = resolveRepoRoot(cwd);
   let hookOutput: Record<string, unknown> | null = null;
 
   try {
     const db = openStore();
     try {
       recordHookInvocation(db, { sessionId, promptId, eventName });
-      const adapter = new ClaudeCodeAdapter(db, sessionId, promptId, cwd);
+      const adapter = new ClaudeCodeAdapter(db, sessionId, promptId, repoRoot);
       adapter.ensureTurnStarted();
       // Unconditional on every firing, same as ensureTurnStarted above — a
       // cheap read that only does real work (building a tree snapshot) the
@@ -317,9 +328,13 @@ async function runInternalHook(): Promise<void> {
           hookOutput = { systemMessage: messageParts.join(" ") };
         }
       } else if (eventName === "PreToolUse") {
-        const { config } = loadConfig(cwd);
+        const { config } = loadConfig(repoRoot);
         if (config.gateMode === "hard") {
-          const pending = getPendingQuestionsForSession(db, sessionId);
+          // Deliberately the age-limited query, not getPendingQuestionsForSession
+          // — see DECISIONS.md's "Stale pending question cutoff" entry for
+          // why a resumed session shouldn't be blocked by work left over
+          // from days ago, even though it's technically the same session_id.
+          const pending = getBlockingPendingQuestionsForSession(db, sessionId);
           if (pending.length > 0) {
             hookOutput = {
               hookSpecificOutput: {
@@ -389,7 +404,12 @@ async function main(): Promise<void> {
   }
 
   if (command === "init") {
-    await runInit(process.cwd());
+    // Same repo-root resolution as the hook path (see runInternalHook) —
+    // running `grasp init` from a subdirectory should install hooks and
+    // write `.grasp.json` at the actual repo root, matching where
+    // ClaudeCodeAdapter/loadConfig look for them, not the exact directory
+    // the command happened to be run from.
+    await runInit(resolveRepoRoot(process.cwd()));
     return;
   }
 

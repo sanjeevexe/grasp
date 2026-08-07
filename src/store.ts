@@ -351,10 +351,13 @@ export function getPendingQuestions(db: Database.Database): EventRecord[] {
 
 /**
  * Same "pending question" definition, scoped to one Claude Code
- * `session_id` — what the `PreToolUse` hard-gate check and the `Stop`
- * nudge both use (see DECISIONS.md's "gate-check scope" entry): whether
- * *this session's own* work has an unanswered question outstanding, not
- * whether the user has anything pending anywhere.
+ * `session_id` — what the `Stop` nudge uses (see DECISIONS.md's
+ * "gate-check scope" entry): whether *this session's own* work has an
+ * unanswered question outstanding, not whether the user has anything
+ * pending anywhere. The nudge is informational only (never blocks), so it
+ * intentionally counts everything regardless of age — see
+ * `getBlockingPendingQuestionsForSession` below for the narrower,
+ * age-limited definition the hard-gate check itself uses.
  */
 export function getPendingQuestionsForSession(
   db: Database.Database,
@@ -365,6 +368,45 @@ export function getPendingQuestionsForSession(
       `SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} AND session_id = ? ORDER BY timestamp ASC`
     )
     .all(sessionId);
+  return rows.map(fromEventRow);
+}
+
+/**
+ * How old a pending question can be and still actively deny a tool call
+ * under hard-gate mode. README/TESTING_GUIDE both document hard-gate as
+ * scoped to "that specific session" and explicitly promise it "never
+ * blocks you over something left over from a different day" — but a Claude
+ * Code `session_id` can genuinely be resumed days or weeks later (e.g.
+ * `claude --resume`), so `session_id` scoping alone doesn't actually
+ * guarantee that. This is Grasp's own gap-filling choice (not settled by
+ * the brief): 24 hours is a deliberately generous, simple "still basically
+ * the same sitting" cutoff — long enough to never interrupt a same-day
+ * session picked back up after a break, short enough that a session
+ * abandoned and resumed on a different calendar day reliably falls outside
+ * it. See DECISIONS.md's "Stale pending question cutoff" entry.
+ */
+export const HARD_GATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The narrower definition of "pending" the `PreToolUse` hard-gate check
+ * uses: real, unanswered, unskipped questions for this session AND recent
+ * enough (within `HARD_GATE_MAX_AGE_MS`) to still actively block. An old
+ * question outside that window remains fully visible and answerable in
+ * `grasp review` and still counts toward the `Stop` nudge
+ * (`getPendingQuestionsForSession` above) — this function only narrows
+ * what's allowed to DENY a tool call, never what's shown or answerable.
+ */
+export function getBlockingPendingQuestionsForSession(
+  db: Database.Database,
+  sessionId: string,
+  now: Date = new Date()
+): EventRecord[] {
+  const cutoff = new Date(now.getTime() - HARD_GATE_MAX_AGE_MS).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} AND session_id = ? AND timestamp >= ? ORDER BY timestamp ASC`
+    )
+    .all(sessionId, cutoff);
   return rows.map(fromEventRow);
 }
 
@@ -521,6 +563,26 @@ export function setCheckpointTree(
   db.prepare(
     `INSERT INTO capture_checkpoints (session_id, repo, tree_sha, updated_at) VALUES (?, ?, ?, ?)
      ON CONFLICT(session_id, repo) DO UPDATE SET tree_sha = excluded.tree_sha, updated_at = excluded.updated_at`
+  ).run(sessionId, repo, treeSha, new Date().toISOString());
+}
+
+/**
+ * Seeds a checkpoint only if none exists yet for this (session, repo) pair
+ * — an `INSERT OR IGNORE`, not an upsert. Used specifically where clobbering
+ * a checkpoint some other, possibly-racing process already advanced would be
+ * wrong (initial seeding, and the "no previous checkpoint at all" branch of
+ * an atomic claim) — see `ClaudeCodeAdapter.ensureCheckpointSeeded`/
+ * `claimTransition` for the call sites and DECISIONS.md's "Atomic checkpoint
+ * claiming" entry.
+ */
+export function insertCheckpointTreeIfAbsent(
+  db: Database.Database,
+  sessionId: string,
+  repo: string,
+  treeSha: string
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO capture_checkpoints (session_id, repo, tree_sha, updated_at) VALUES (?, ?, ?, ?)`
   ).run(sessionId, repo, treeSha, new Date().toISOString());
 }
 

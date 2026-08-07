@@ -61,6 +61,85 @@ function readJsonFile(filePath: string): unknown {
   }
 }
 
+const GATE_MODES = ["soft", "hard"] as const;
+
+/**
+ * Validates the *shape* of an override object read from a config file —
+ * each key present must have the right type/enum/range, not just be valid
+ * JSON. Only checks keys that are actually present (this validates a
+ * partial override, not a fully-merged GraspConfig — `DEFAULT_CONFIG`
+ * itself is always valid and never runs through this).
+ *
+ * Found by an independent test pass: a syntactically valid config with the
+ * wrong field type (e.g. `"ignorePatterns": "scripts/"` instead of an
+ * array) previously reached `Array.prototype.some` deep inside the filter
+ * and crashed there — well past the point where a clear, attributable error
+ * could be shown, and (before `checkAndCapture`'s atomic-transaction
+ * rewrite) after the checkpoint had already advanced, permanently losing
+ * the diff that triggered it. Validating here, at load time, with the same
+ * "throw a clear error, never silently coerce or drop the value" policy
+ * already used for malformed JSON, catches it at the actual source instead.
+ * See DECISIONS.md's "Config schema validation" entry.
+ */
+function validateConfigOverride(value: unknown, filePath: string): asserts value is Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new Error(`Grasp: ${filePath} must contain a JSON object at its top level.`);
+  }
+
+  const errors: string[] = [];
+
+  if (value.gateMode !== undefined && !GATE_MODES.includes(value.gateMode as any)) {
+    errors.push(`gateMode must be one of ${GATE_MODES.map((m) => `"${m}"`).join(" | ")}, got ${JSON.stringify(value.gateMode)}`);
+  }
+
+  if (value.costCapUsd !== undefined) {
+    if (typeof value.costCapUsd !== "number" || !Number.isFinite(value.costCapUsd) || value.costCapUsd < 0) {
+      errors.push(`costCapUsd must be a non-negative number, got ${JSON.stringify(value.costCapUsd)}`);
+    }
+  }
+
+  if (value.ignorePatterns !== undefined) {
+    const isStringArray = Array.isArray(value.ignorePatterns) && value.ignorePatterns.every((p) => typeof p === "string");
+    if (!isStringArray) {
+      errors.push(`ignorePatterns must be an array of strings, got ${JSON.stringify(value.ignorePatterns)}`);
+    }
+  }
+
+  if (value.questionsPerSessionCap !== undefined) {
+    if (!Number.isInteger(value.questionsPerSessionCap) || (value.questionsPerSessionCap as number) < 1) {
+      errors.push(`questionsPerSessionCap must be a positive integer, got ${JSON.stringify(value.questionsPerSessionCap)}`);
+    }
+  }
+
+  if (value.diffThresholds !== undefined) {
+    if (!isPlainObject(value.diffThresholds)) {
+      errors.push(`diffThresholds must be an object, got ${JSON.stringify(value.diffThresholds)}`);
+    } else {
+      for (const key of ["minChangedLines", "maxTotalChangedLines", "maxSingleFileChangedLines"] as const) {
+        const fieldValue = (value.diffThresholds as Record<string, unknown>)[key];
+        if (fieldValue === undefined) continue;
+        if (typeof fieldValue !== "number" || !Number.isFinite(fieldValue) || fieldValue < 0) {
+          errors.push(`diffThresholds.${key} must be a non-negative number, got ${JSON.stringify(fieldValue)}`);
+        }
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `Grasp: ${filePath} has invalid config value(s):\n` +
+        errors.map((e) => `  - ${e}`).join("\n") +
+        `\nFix the file manually — Grasp will not overwrite a file it can't validate.`
+    );
+  }
+}
+
+function readAndValidateConfigFile(filePath: string): Record<string, unknown> {
+  const parsed = readJsonFile(filePath);
+  validateConfigOverride(parsed, filePath);
+  return parsed;
+}
+
 /**
  * Reads the global config, creating it with defaults on first run.
  * Never overwrites an existing (even malformed) file. `globalConfigPath`/
@@ -83,7 +162,7 @@ export function ensureGlobalConfigFile(
     );
     return structuredClone(DEFAULT_CONFIG);
   }
-  const parsed = readJsonFile(globalConfigPath);
+  const parsed = readAndValidateConfigFile(globalConfigPath);
   return deepMerge(DEFAULT_CONFIG, parsed);
 }
 
@@ -108,7 +187,7 @@ export function loadConfig(
     return { config: globalConfig, globalConfigPath, repoConfigPath: null };
   }
 
-  const repoOverride = readJsonFile(repoConfigPath);
+  const repoOverride = readAndValidateConfigFile(repoConfigPath);
   const merged = deepMerge(globalConfig, repoOverride);
   return { config: merged, globalConfigPath, repoConfigPath };
 }

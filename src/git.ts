@@ -73,3 +73,34 @@ export function listUntrackedFiles(repoPath: string): string[] {
   const result = runGit(repoPath, ["ls-files", "--others", "--exclude-standard"]);
   return result.stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
 }
+
+/**
+ * Resolves the git repository root for `cwd`, so config lookup, checkpoint
+ * keying, and hook installation behave the same whether Claude Code's `cwd`
+ * for a session is the repo root or some subdirectory of it (e.g. `repo/src`).
+ * Falls back to `cwd` itself if it isn't inside a git work tree at all —
+ * callers already handle "not a git repo" as a degenerate case elsewhere, so
+ * this never throws.
+ */
+export function resolveRepoRoot(cwd: string): string {
+  try {
+    const result = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+    const root = result.stdout.trim();
+    return root.length > 0 ? root : cwd;
+  } catch {
+    return cwd;
+  }
+}
+
+/**
+ * True when a caught `runGit` error is specifically git reporting a missing
+ * object ("fatal: bad object <sha>") — the shape of failure produced when a
+ * previously-written but never-referenced tree (e.g. one of Grasp's own
+ * checkpoint snapshots — see gitDiffCapture.ts's checkpoint module doc) has
+ * since been reclaimed by `git gc`/`git prune`. Distinguished from every
+ * other git failure so callers can self-heal (re-seed the checkpoint) rather
+ * than treat this the same as a genuine, unexpected git error.
+ */
+export function isMissingGitObjectError(err: unknown): boolean {
+  return err instanceof Error && /fatal: bad object/i.test(err.message);
+}

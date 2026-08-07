@@ -119,7 +119,23 @@ function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
   const stdout = execFileSync(
     "claude",
     ["-p", prompt, "--output-format", "json", "--allowedTools", "", "--max-turns", "1"],
-    { encoding: "utf-8", maxBuffer: 1024 * 1024 * 16, timeout: GENERATION_TIMEOUT_MS }
+    {
+      encoding: "utf-8",
+      maxBuffer: 1024 * 1024 * 16,
+      timeout: GENERATION_TIMEOUT_MS,
+      // Explicit, not the execFileSync default: Node's exec-family helpers
+      // send a failing child's stderr straight to the PARENT's stderr by
+      // default (only stdout is piped/captured for the return value). Since
+      // this parent is a Claude Code hook process, that meant a `claude -p`
+      // failure printed the child's raw stderr where the user could see it
+      // — found by an independent test pass, contradicting the documented
+      // "fails gracefully, no confusing error message in your way" behavior
+      // (README/TESTING_GUIDE). Piping stderr here instead means it's only
+      // ever available via the caught error's `.stderr`, which this code
+      // doesn't surface anywhere — a failure stays genuinely quiet, logged
+      // to the DB as a miss like every other failure mode.
+      stdio: ["ignore", "pipe", "pipe"],
+    }
   );
   const envelope = JSON.parse(stdout);
   return {
@@ -143,6 +159,19 @@ function extractJsonBlock(text: string): string {
   return fenceMatch ? fenceMatch[1].trim() : trimmed;
 }
 
+/**
+ * The prompt tells the model conceptTag must be "a short, reusable,
+ * kebab-case tag" specifically because memoization (brief §3.2) is a plain
+ * string match against previously-stored tags — a differently-spelled or
+ * differently-cased tag for the same underlying concept (e.g.
+ * "Not Kebab Case!" or "mutex_vs_channel") would defeat the "don't re-teach
+ * this" check silently. Found by an independent test pass: a malformed tag
+ * was accepted and stored as-is. Enforced here, deterministically, rather
+ * than trusted from the model's own compliance — same posture as every
+ * other part of the response contract this parser checks.
+ */
+const KEBAB_CASE_TAG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
 /** Returns null for anything that doesn't match the contract — malformed JSON, wrong types, or an internally inconsistent shape. Never throws. */
 export function parseJudgeResponse(raw: string): JudgeResponse | null {
   let obj: any;
@@ -161,7 +190,7 @@ export function parseJudgeResponse(raw: string): JudgeResponse | null {
     return { worthAsking: false, conceptTag: null, questionConcept: null, questionInstance: null };
   }
 
-  if (typeof obj.conceptTag !== "string" || obj.conceptTag.trim().length === 0) return null;
+  if (typeof obj.conceptTag !== "string" || !KEBAB_CASE_TAG.test(obj.conceptTag.trim())) return null;
   if (typeof obj.questionInstance !== "string" || obj.questionInstance.trim().length === 0) return null;
   if (
     obj.questionConcept !== null &&
@@ -302,7 +331,23 @@ export function runGeneration(db: Database.Database, params: GenerationParams): 
   // deterministically against its own DB — the model's own judgment isn't
   // trusted as the sole authority for a correctness guarantee.
   const alreadyAnswered = getConceptTagGlobal(db, parsed.conceptTag as string, true).length > 0;
-  const includeConceptQuestion = parsed.questionConcept !== null && !alreadyAnswered;
+
+  if (!alreadyAnswered && parsed.questionConcept === null) {
+    // The model proposed a concept tag it has never been told was already
+    // answered, yet omitted the concept question the prompt's own contract
+    // requires in that case ("questionConcept must be null if conceptTag is
+    // in the already-answered list ... otherwise it must be a non-empty
+    // string"). Silently accepting this as an instance-only question would
+    // let a brand-new concept get marked "answered" the moment the user
+    // answers the instance question — teaching nothing, in direct violation
+    // of brief §3.2's concept-first requirement. Found by an independent
+    // test pass. Treated as a contract violation like any other malformed
+    // response: a paid-for miss, not a silently-accepted success — see
+    // DECISIONS.md's "Concept-first enforcement" entry.
+    return recordMiss(db, params, diffSummary, "error", envelope.totalCostUsd);
+  }
+
+  const includeConceptQuestion = !alreadyAnswered;
   const questionType: "instance" | "both" = includeConceptQuestion ? "both" : "instance";
 
   const eventId = insertEvent(
