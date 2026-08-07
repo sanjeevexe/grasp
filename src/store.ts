@@ -23,6 +23,7 @@ const SCHEMA_SQL = `
     skipped INTEGER NOT NULL DEFAULT 0,
     skip_reason TEXT,
     cost_usd REAL,
+    cost_unknown INTEGER NOT NULL DEFAULT 0,
     diff_files_json TEXT
   );
 
@@ -146,6 +147,9 @@ function migrateSchema(db: Database.Database): void {
   if (!eventsColumnNames.has("diff_files_json")) {
     db.exec(`ALTER TABLE events ADD COLUMN diff_files_json TEXT`);
   }
+  if (!eventsColumnNames.has("cost_unknown")) {
+    db.exec(`ALTER TABLE events ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`);
+  }
   // Unconditional (not just inside the branch above): on a fresh install
   // SCHEMA_SQL's CREATE TABLE already includes session_id, so the ALTER
   // above is skipped, but the index still needs creating exactly once —
@@ -215,6 +219,7 @@ function toEventRow(event: EventRecord) {
     skipped: event.skipped ? 1 : 0,
     skipReason: event.skipReason,
     costUsd: event.costUsd,
+    costUnknown: event.costUnknown ? 1 : 0,
     diffFilesJson: event.diffFiles ? JSON.stringify(event.diffFiles) : null,
   };
 }
@@ -237,6 +242,7 @@ function fromEventRow(row: any): EventRecord {
     skipped: Boolean(row.skipped),
     skipReason: row.skip_reason,
     costUsd: row.cost_usd,
+    costUnknown: Boolean(row.cost_unknown),
     diffFiles: row.diff_files_json ? JSON.parse(row.diff_files_json) : null,
   };
 }
@@ -255,12 +261,12 @@ export function insertEvent(
       timestamp, repo, session_id, diff_hash, diff_summary,
       question_concept, question_instance, question_type, generation_source,
       miss_reason, answer_concept, answer_instance,
-      skipped, skip_reason, cost_usd, diff_files_json
+      skipped, skip_reason, cost_usd, cost_unknown, diff_files_json
     ) VALUES (
       @timestamp, @repo, @sessionId, @diffHash, @diffSummary,
       @questionConcept, @questionInstance, @questionType, @generationSource,
       @missReason, @answerConcept, @answerInstance,
-      @skipped, @skipReason, @costUsd, @diffFilesJson
+      @skipped, @skipReason, @costUsd, @costUnknown, @diffFilesJson
     )
   `);
   const insertTagStmt = db.prepare(
@@ -492,6 +498,24 @@ export function getSessionCostUsd(db: Database.Database, sessionId: string): num
     .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS total FROM events WHERE session_id = ?`)
     .get(sessionId) as { total: number };
   return row.total;
+}
+
+/**
+ * True if this session has already recorded a miss whose real `claude -p`
+ * cost genuinely could not be determined (`cost_unknown = 1` — see
+ * `EventRecord.costUnknown`'s comment). `getSessionCostUsd` sums NULL as 0,
+ * which is correct for rows where no call was ever attempted
+ * (`cap_reached`, slot-wait timeout) but would silently let an attempted-
+ * but-uncosted call look "free" and leave the session's cap enforcement
+ * bypassable by repeating it — this is the separate signal `runGeneration`
+ * checks to close that gap. See DECISIONS.md's "Unknown-cost failures halt
+ * further generation for the session" entry.
+ */
+export function hasUnknownCostFailure(db: Database.Database, sessionId: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS found FROM events WHERE session_id = ? AND cost_unknown = 1 LIMIT 1`)
+    .get(sessionId) as { found: number } | undefined;
+  return row !== undefined;
 }
 
 /**

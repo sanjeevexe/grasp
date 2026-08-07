@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { openStore, getSessionCostUsd, getSessionQuestionCount } from "../src/store";
+import { openStore, getSessionCostUsd, getSessionQuestionCount, hasUnknownCostFailure } from "../src/store";
 import { runGeneration, GenerationParams } from "../src/generation";
 import { diffFile, testConfig } from "./helpers";
 
@@ -217,6 +217,66 @@ test("runGeneration: a malformed result with a real, present cost is a miss with
   assert.equal(outcome!.missReason, "error");
   const row = db.prepare("SELECT cost_usd FROM events WHERE id = ?").get(outcome!.eventId) as any;
   assert.equal(row.cost_usd, 0.002, "a known cost must still be recorded even when the response body itself is unusable");
+  db.close();
+});
+
+test("runGeneration: repeated unknown-cost failures do not keep invoking claude — the first one halts the session (independent test report repro)", () => {
+  // Reproduces the report's exact scenario: costCapUsd set very low, three
+  // successive meaningful diffs in one session, and a mock that always
+  // returns a well-formed response with NO total_cost_usd. Before the fix,
+  // all three calls actually ran (cost summed as 0 each time, so the cap
+  // was never crossed). After the fix, only the first call should ever
+  // reach the mock — every later call for the same session must be blocked
+  // before invoking claude at all, once the session's true cost becomes
+  // unknowable.
+  const db = openStore(tempDbPath());
+  const counter = tempCounterPath();
+  const config = testConfig({ costCapUsd: 0.001, questionsPerSessionCap: 999 });
+  const params = baseParams({ config });
+
+  withMockClaude(
+    { GRASP_TEST_MOCK_MODE: "missing-cost", GRASP_TEST_MOCK_COUNTER: counter },
+    () => {
+      const r1 = runGeneration(db, params);
+      const r2 = runGeneration(db, params);
+      const r3 = runGeneration(db, params);
+
+      assert.equal(r1.missReason, "error", "call 1: claude was actually invoked and returned an uncosted response");
+      assert.equal(r2.missReason, "cap_reached", "call 2: must be blocked BEFORE invoking claude — cost is unknowable");
+      assert.equal(r3.missReason, "cap_reached", "call 3: same — must never reach claude either");
+    }
+  );
+
+  assert.equal(
+    fs.readFileSync(counter, "utf-8"),
+    "1",
+    "the mock claude binary must only have actually run once across all three runGeneration calls"
+  );
+  assert.equal(hasUnknownCostFailure(db, params.sessionId), true);
+  assert.equal(getSessionCostUsd(db, params.sessionId), 0, "cost sum stays 0 (never fabricated), but the session is still halted via the separate unknown-cost signal");
+  db.close();
+});
+
+test("runGeneration: a valid JSON error envelope on a nonzero exit has its reported cost recovered, not discarded (independent test report repro)", () => {
+  // Reproduces the report's second scenario: a mock that prints a
+  // well-formed JSON envelope with a real total_cost_usd and then exits 1
+  // (the same convention the real, unauthenticated Claude CLI uses for some
+  // errors). Before the fix, execFileSync's thrown error discarded stdout
+  // entirely and the call was recorded with cost_usd = NULL. After the fix,
+  // the reported cost must be recovered from the error's own .stdout.
+  const db = openStore(tempDbPath());
+  const params = baseParams();
+  let outcome: ReturnType<typeof runGeneration> | undefined;
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "error-envelope-exit1" }, () => {
+    outcome = runGeneration(db, params);
+  });
+
+  assert.equal(outcome!.missReason, "error");
+  const row = db.prepare("SELECT cost_usd, cost_unknown FROM events WHERE id = ?").get(outcome!.eventId) as any;
+  assert.equal(row.cost_usd, 0.001, "the cost reported in the exit-1 envelope must be recovered, not discarded as NULL");
+  assert.equal(row.cost_unknown, 0, "a recovered, real cost figure means this is NOT an unknown-cost failure");
+  assert.equal(hasUnknownCostFailure(db, params.sessionId), false, "a recovered real cost must not halt further generation for the session");
   db.close();
 });
 

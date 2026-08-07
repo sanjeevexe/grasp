@@ -8,6 +8,7 @@ import {
   getConceptTagGlobal,
   getSessionCostUsd,
   getSessionQuestionCount,
+  hasUnknownCostFailure,
   insertEvent,
   releaseGenerationSlot,
   tryClaimGenerationSlot,
@@ -152,42 +153,14 @@ export function isTimeoutError(err: unknown): boolean {
  * `--safe-mode` already covering this). See DECISIONS.md's "Generation call
  * tool/context isolation flags" entry.
  */
-function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
-  const stdout = execFileSync(
-    "claude",
-    [
-      "-p",
-      prompt,
-      "--output-format",
-      "json",
-      "--tools",
-      "",
-      "--safe-mode",
-      "--setting-sources",
-      "",
-      "--strict-mcp-config",
-      "--max-turns",
-      "1",
-    ],
-    {
-      encoding: "utf-8",
-      maxBuffer: 1024 * 1024 * 16,
-      timeout: GENERATION_TIMEOUT_MS,
-      // Explicit, not the execFileSync default: Node's exec-family helpers
-      // send a failing child's stderr straight to the PARENT's stderr by
-      // default (only stdout is piped/captured for the return value). Since
-      // this parent is a Claude Code hook process, that meant a `claude -p`
-      // failure printed the child's raw stderr where the user could see it
-      // — found by an independent test pass, contradicting the documented
-      // "fails gracefully, no confusing error message in your way" behavior
-      // (README/TESTING_GUIDE). Piping stderr here instead means it's only
-      // ever available via the caught error's `.stderr`, which this code
-      // doesn't surface anywhere — a failure stays genuinely quiet, logged
-      // to the DB as a miss like every other failure mode.
-      stdio: ["ignore", "pipe", "pipe"],
-    }
-  );
-  const envelope = JSON.parse(stdout);
+/** Parses a `claude -p --output-format json` stdout string into a {@link ClaudeEnvelope}, or null if it isn't valid JSON. Shared by the normal-exit path and the nonzero-exit recovery path in {@link invokeClaudeJudge} below, so both apply the identical cost-validation rule. */
+function parseClaudeEnvelope(stdout: string): ClaudeEnvelope | null {
+  let envelope: any;
+  try {
+    envelope = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
   const rawCost = envelope.total_cost_usd;
   // A negative or non-finite cost is malformed, not a real spend figure —
   // found by an independent test pass: a mock response reporting
@@ -202,6 +175,71 @@ function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
     resultText: typeof envelope.result === "string" ? envelope.result : "",
     isError: Boolean(envelope.is_error),
   };
+}
+
+function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "json",
+    "--tools",
+    "",
+    "--safe-mode",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--max-turns",
+    "1",
+  ];
+  const options = {
+    encoding: "utf-8" as const,
+    maxBuffer: 1024 * 1024 * 16,
+    timeout: GENERATION_TIMEOUT_MS,
+    // Explicit, not the execFileSync default: Node's exec-family helpers
+    // send a failing child's stderr straight to the PARENT's stderr by
+    // default (only stdout is piped/captured for the return value). Since
+    // this parent is a Claude Code hook process, that meant a `claude -p`
+    // failure printed the child's raw stderr where the user could see it
+    // — found by an independent test pass, contradicting the documented
+    // "fails gracefully, no confusing error message in your way" behavior
+    // (README/TESTING_GUIDE). Piping stderr here instead means it's only
+    // ever available via the caught error's `.stderr`, which this code
+    // doesn't surface anywhere — a failure stays genuinely quiet, logged
+    // to the DB as a miss like every other failure mode.
+    stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+  };
+  try {
+    const stdout = execFileSync("claude", args, options);
+    const envelope = parseClaudeEnvelope(stdout);
+    if (!envelope) {
+      throw new Error("claude -p returned output that was not valid JSON");
+    }
+    return envelope;
+  } catch (err) {
+    // `claude`'s own "print a JSON result then exit nonzero" convention for
+    // some error responses (e.g. its unauthenticated-error case) means a
+    // nonzero exit doesn't imply stdout was empty or useless — Node's
+    // exec-family helpers still capture it, just onto the thrown error's
+    // `.stdout` instead of returning it normally. Found by an independent
+    // test pass: a mock printing a valid envelope with a real
+    // `total_cost_usd` and then exiting 1 had that cost silently discarded,
+    // recorded as unknown instead of the real figure the process actually
+    // reported. Recovering it here (rather than at each call site) means
+    // every caller of invokeClaudeJudge automatically benefits, and a
+    // genuine parse failure (no usable JSON either way) still rethrows the
+    // original error unchanged, so isTimeoutError's classification of it
+    // downstream is unaffected. See DECISIONS.md's "Recover cost from a
+    // nonzero-exit envelope" entry.
+    const stdoutFromError = typeof (err as { stdout?: unknown })?.stdout === "string"
+      ? ((err as { stdout: string }).stdout)
+      : null;
+    const recovered = stdoutFromError ? parseClaudeEnvelope(stdoutFromError) : null;
+    if (recovered) {
+      return recovered;
+    }
+    throw err;
+  }
 }
 
 export interface JudgeResponse {
@@ -363,7 +401,8 @@ function recordMiss(
   params: GenerationParams,
   diffSummary: string,
   missReason: MissReason,
-  costUsd: number | null
+  costUsd: number | null,
+  costUnknown: boolean = false
 ): GenerationOutcome {
   const eventId = insertEvent(db, {
     timestamp: new Date().toISOString(),
@@ -381,6 +420,7 @@ function recordMiss(
     skipped: false,
     skipReason: null,
     costUsd,
+    costUnknown,
     diffFiles: null,
   });
   return { eventId, missReason, questionType: null };
@@ -416,6 +456,22 @@ export function runGeneration(db: Database.Database, params: GenerationParams): 
   }
 
   try {
+    // A prior call this session whose real cost couldn't be determined
+    // (process failure/timeout with no recoverable envelope, or a
+    // well-formed response missing total_cost_usd) means the session's true
+    // spend is no longer knowable — summing cost_usd would silently treat
+    // that call as free and let the cap keep being checked against an
+    // undercount forever. Checked before the cost/question caps below and
+    // blocks unconditionally (never invokes claude -p again this session),
+    // the same conservative "never invoke, just record a miss" pattern the
+    // caps themselves use. Found by an independent test pass: three
+    // successive uncosted mock failures in one session all ran, none
+    // cap-blocked. See DECISIONS.md's "Unknown-cost failures halt further
+    // generation for the session" entry.
+    if (hasUnknownCostFailure(db, sessionId)) {
+      return recordMiss(db, params, diffSummary, "cap_reached", null);
+    }
+
     const spentSoFar = getSessionCostUsd(db, sessionId);
     if (spentSoFar >= config.costCapUsd) {
       // Cap already met/exceeded — never invoke `claude -p` at all.
@@ -459,16 +515,24 @@ function runJudgeAndRecord(
   try {
     envelope = invokeClaudeJudge(prompt);
   } catch (err) {
-    // Process never produced a usable envelope at all — no cost figure to
-    // record either way (genuinely unknown, not 0). A timeout kill is
-    // distinguished from every other spawn/exit failure specifically —
-    // see isTimeoutError's own comment for how that's actually detected.
+    // Process never produced a usable envelope at all (even after
+    // invokeClaudeJudge's own best-effort recovery of a nonzero-exit
+    // envelope) — no cost figure to record either way (genuinely unknown,
+    // not 0), so this session's true spend is no longer knowable and
+    // further generation must stop for it (see the hasUnknownCostFailure
+    // check in runGeneration). A timeout kill is distinguished from every
+    // other spawn/exit failure specifically — see isTimeoutError's own
+    // comment for how that's actually detected.
     const missReason: MissReason = isTimeoutError(err) ? "timeout" : "error";
-    return recordMiss(db, params, diffSummary, missReason, null);
+    return recordMiss(db, params, diffSummary, missReason, null, true);
   }
 
   if (envelope.isError) {
-    return recordMiss(db, params, diffSummary, "error", envelope.totalCostUsd);
+    // total_cost_usd can itself be missing on an error envelope (rare, but
+    // the contract doesn't guarantee it) — costUnknown reflects that
+    // regardless of the error/is_error split, same as every other branch
+    // here.
+    return recordMiss(db, params, diffSummary, "error", envelope.totalCostUsd, envelope.totalCostUsd === null);
   }
 
   if (envelope.totalCostUsd === null) {
@@ -479,8 +543,11 @@ function runJudgeAndRecord(
     // it as a miss instead — see DECISIONS.md's "Missing total_cost_usd"
     // entry. This intentionally never reaches parseJudgeResponse: even a
     // perfectly well-formed question in this response isn't recorded,
-    // since there's no way to know what it actually cost.
-    return recordMiss(db, params, diffSummary, "error", null);
+    // since there's no way to know what it actually cost. costUnknown=true
+    // additionally halts further generation for this session — see
+    // DECISIONS.md's "Unknown-cost failures halt further generation for the
+    // session" entry.
+    return recordMiss(db, params, diffSummary, "error", null, true);
   }
 
   const parsed = parseJudgeResponse(envelope.resultText);

@@ -69,6 +69,21 @@ if (mode === "invalid-tag-format") {
 }
 
 if (mode === "missing-cost") {
+  // Counter is optional here (only caps.test.ts's cost-cap-focused test
+  // above passes GRASP_TEST_MOCK_COUNTER) — used by the "repeated
+  // unknown-cost failures must not keep invoking claude" regression test to
+  // prove the mock is only ever actually invoked once per session, not once
+  // per runGeneration call.
+  const counterPath = process.env.GRASP_TEST_MOCK_COUNTER;
+  if (counterPath) {
+    let n = 0;
+    try {
+      n = parseInt(fs.readFileSync(counterPath, "utf-8"), 10) || 0;
+    } catch {
+      n = 0;
+    }
+    fs.writeFileSync(counterPath, String(n + 1));
+  }
   const result = {
     worthAsking: true,
     conceptTag: "missing-cost-tag",
@@ -77,6 +92,18 @@ if (mode === "missing-cost") {
   };
   process.stdout.write(JSON.stringify({ result: JSON.stringify(result), is_error: false }));
   process.exit(0);
+}
+
+if (mode === "error-envelope-exit1") {
+  // Claude Code's own "print a JSON result then exit nonzero" convention
+  // for some error responses (its unauthenticated-error case, per the
+  // independent test report) — the envelope itself is valid and reports a
+  // real cost, but the process exits 1, which makes Node's execFileSync
+  // throw instead of returning stdout normally. Used to prove
+  // invokeClaudeJudge recovers the cost from the thrown error's own
+  // `.stdout` instead of discarding it.
+  process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: "", is_error: true }));
+  process.exit(1);
 }
 
 if (mode === "negative-cost") {

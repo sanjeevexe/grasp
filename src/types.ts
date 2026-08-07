@@ -35,6 +35,20 @@ export interface EventRecord {
   skipReason: string | null;
   costUsd: number | null;
   /**
+   * True only for a miss row where a real `claude -p` invocation was
+   * genuinely attempted but its cost could not be determined (process
+   * failure/timeout with no recoverable envelope, or a well-formed
+   * response missing `total_cost_usd`) — distinct from `costUsd === null`
+   * on a `cap_reached`/slot-wait-timeout row, where no call was ever
+   * attempted at all and there's nothing unknown about it. Drives the
+   * "stop generating for this session once its budget is unknowable"
+   * safety rail — see `hasUnknownCostFailure` (store.ts) and
+   * DECISIONS.md's "Unknown-cost failures halt further generation for the
+   * session" entry. Optional/defaults to false so existing call sites
+   * (cli.ts debug:answer, tests) that never set it don't need updating.
+   */
+  costUnknown?: boolean;
+  /**
    * The exact significant/post-filter files+hunks shown to the judge model
    * when this question was generated (Phase 4's `significantFiles`),
    * persisted verbatim so `grasp review` can render them without re-fetching

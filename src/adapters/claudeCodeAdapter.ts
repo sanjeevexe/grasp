@@ -66,8 +66,11 @@ export function resolvePromptId(payload: Pick<ClaudeCodeHookPayload, "prompt_id"
  * AgentAdapter interface. A turn, not a whole interactive CLI session, is
  * this adapter's unit of work — see DECISIONS.md's "Stop fires per turn,
  * not per session" entry for why that's the correct binding for
- * onSessionComplete's "present before final output" semantics despite the
- * name.
+ * `onSessionComplete`, despite the interface's original name implying a
+ * whole session. As built, `onSessionComplete` just marks the turn done;
+ * it does not flush or present a queue — the project moved to on-demand
+ * `grasp review` instead of gating on completion (see
+ * grasp-project-brief.md's status note and README's architecture section).
  */
 export class ClaudeCodeAdapter implements AgentAdapter {
   readonly supportsHeadlessSelfInvocation = true;
@@ -290,10 +293,12 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   /**
    * Marks this turn complete. Idempotent: if some other invocation already
    * completed this exact (sessionId, promptId) turn, this safely does
-   * nothing rather than re-running completion side effects. Flushing a
-   * queue and presenting before final output is Phase 7/8 — this phase
-   * only proves the "exactly once per turn" boundary is real and
-   * detectable.
+   * nothing rather than re-running completion side effects. Does not flush
+   * or present any queue — the as-built architecture surfaces questions via
+   * on-demand `grasp review` (see README) rather than gating on turn/session
+   * completion, so this only needs to prove the "exactly once per turn"
+   * boundary is real and detectable; the `Stop` hook's own nudge message is
+   * handled separately in `src/cli.ts`.
    */
   async onSessionComplete(): Promise<void> {
     completeTurn(this.db, { sessionId: this.sessionId, promptId: this.promptId });

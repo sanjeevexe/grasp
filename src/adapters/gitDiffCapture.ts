@@ -364,6 +364,10 @@ export class GitDiffAdapter implements AgentAdapter {
   }
 
   async onSessionComplete(): Promise<void> {
-    // Flushing the queue and presenting before final output is Phase 7/8.
+    // No queue to flush or present here — the as-built architecture
+    // surfaces questions via on-demand `grasp review` (see README), not by
+    // gating on session completion. GitDiffAdapter itself also isn't wired
+    // into real question generation yet (see onChangeDetected's comment
+    // above); this is a no-op until it is.
   }
 }
