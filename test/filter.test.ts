@@ -90,6 +90,62 @@ test("isFileFormattingOnly: false when reflowed lines also change an actual toke
   assert.equal(isFileFormattingOnly(f), false);
 });
 
+test("isFileFormattingOnly: true for a formatter wrapping a return expression in grouping parentheses", () => {
+  // Regression test for the exact case an independent test pass reported as
+  // a real bug: wrapping a return expression across multiple lines with
+  // grouping parentheses (no behavior change) was treated as meaningful and
+  // invoked Claude for a paid question.
+  const f = diffFile({
+    path: "a.ts",
+    insertions: 3,
+    deletions: 1,
+    hunks: [
+      hunk("@@ -1,1 +1,3 @@", [
+        "-  return `Hello, ${name}`;",
+        "+  return (",
+        "+    `Hello, ${name}`",
+        "+  );",
+      ]),
+    ],
+  });
+  assert.equal(isFileFormattingOnly(f), true);
+});
+
+test("isFileFormattingOnly: true for a formatter wrapping an assignment RHS in grouping parentheses", () => {
+  const f = diffFile({
+    path: "a.ts",
+    insertions: 3,
+    deletions: 1,
+    hunks: [hunk("@@ -1,1 +1,3 @@", ["-  const msg = greet(name, title);", "+  const msg = (", "+    greet(name, title)", "+  );"])],
+  });
+  assert.equal(isFileFormattingOnly(f), true);
+});
+
+test("isFileFormattingOnly: false when grouping parentheses are added around a sub-expression, changing precedence", () => {
+  // a && (b || c) is not equivalent to a && b || c — the parens here aren't
+  // wrapping "everything after a safe boundary," they're wrapping only the
+  // RHS of a binary operator, which can change what the code does. This must
+  // never be filtered out as formatting-only.
+  const f = diffFile({
+    path: "a.ts",
+    insertions: 1,
+    deletions: 1,
+    hunks: [hunk("@@ -1,1 +1,1 @@", ["-  if (a && b || c) {", "+  if (a && (b || c)) {"])],
+  });
+  assert.equal(isFileFormattingOnly(f), false);
+});
+
+test("isFileFormattingOnly: false when grouping parentheses are added after a comparison operator", () => {
+  // a == (b || c) is not equivalent to a == b || c for the same reason.
+  const f = diffFile({
+    path: "a.ts",
+    insertions: 1,
+    deletions: 1,
+    hunks: [hunk("@@ -1,1 +1,1 @@", ["-  if (a == b || c) {", "+  if (a == (b || c)) {"])],
+  });
+  assert.equal(isFileFormattingOnly(f), false);
+});
+
 // --- isFileGenerated --------------------------------------------------
 
 test("isFileGenerated: true when the file's added content declares itself auto-generated", () => {

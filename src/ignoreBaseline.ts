@@ -1,7 +1,7 @@
 /**
  * Baseline ignore patterns that exist independently of user config.
- * Phase 4 (meaningful-change filtering) is what actually consumes this list —
- * it is stubbed here now, per BUILD_PLAN.md Phase 1, and not read by any logic yet.
+ * Consumed by `classifyIgnoreExclusion` in src/filter.ts (Phase 4's
+ * mechanical pre-filter) on every captured diff.
  */
 export const BASELINE_IGNORE_PATTERNS: readonly string[] = [
   "package-lock.json",

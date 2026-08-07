@@ -310,6 +310,61 @@ function stripAllWhitespace(lines: string[]): string {
 }
 
 /**
+ * Keyword/operator boundaries after which everything to the end of the
+ * statement is, by construction, one complete expression with nothing to
+ * its left at the same precedence level — so wrapping that entire
+ * remainder in a single redundant parenthesis pair can never change what
+ * the code means, no matter what operators appear inside it.
+ *
+ * Deliberately a short, conservative list rather than "strip all
+ * parentheses and compare": allowing an arbitrary binary operator here
+ * (e.g. `&&`, `==`) would be unsafe, since parenthesizing only its
+ * right-hand side can change precedence relative to what's outside the
+ * parens — `a && (b || c)` is not the same as `a && b || c`, and `a == (b
+ * || c)` is not the same as `a == b || c`. `return`/`throw`/`yield`, an
+ * arrow body, and either side of a plain assignment don't have that
+ * problem: there's no operator to the parens' left at all, so wrapping the
+ * whole remainder is always redundant. See DECISIONS.md's "Formatting-only
+ * detection: recognizing grouping-parenthesis wraps" entry.
+ */
+function endsWithSafeExpressionBoundary(prefix: string): boolean {
+  if (/(?:^|[^\w$])(return|throw|yield\*?)$/.test(prefix)) return true;
+  if (prefix.endsWith("=>")) return true;
+  // A bare "=" (incl. compound assignment like "+=") is safe; "==", "!=",
+  // "<=", ">=" etc. are comparisons, not assignment, and are NOT safe.
+  if (prefix.endsWith("=") && !/[=!<>]=$/.test(prefix)) return true;
+  return false;
+}
+
+/**
+ * True if `added` is exactly `removed` with one redundant grouping
+ * parenthesis pair inserted around the entire trailing expression after a
+ * safe boundary (see `endsWithSafeExpressionBoundary`) — the pattern a
+ * formatter produces when it wraps a long `return`/assignment/arrow-body
+ * expression onto its own line, e.g. `return greet(name);` ->
+ * `return (\n  greet(name)\n);`. Both arguments are expected to already
+ * have all whitespace stripped (see call site) and are compared with a
+ * trailing `;`, if present on both sides, ignored on both sides.
+ */
+function isRedundantExpressionWrap(removedFlat: string, addedFlat: string): boolean {
+  const removedHasSemi = removedFlat.endsWith(";");
+  const addedHasSemi = addedFlat.endsWith(";");
+  if (removedHasSemi !== addedHasSemi) return false;
+  const r = removedHasSemi ? removedFlat.slice(0, -1) : removedFlat;
+  const a = addedHasSemi ? addedFlat.slice(0, -1) : addedFlat;
+  if (a.length !== r.length + 2 || a[a.length - 1] !== ")") return false;
+
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== "(") continue;
+    const prefix = a.slice(0, i);
+    if (prefix !== r.slice(0, i)) continue;
+    if (a.slice(i + 1, a.length - 1) !== r.slice(i)) continue;
+    if (endsWithSafeExpressionBoundary(prefix)) return true;
+  }
+  return false;
+}
+
+/**
  * A hunk is formatting-only if its normalized removed-line sequence exactly
  * equals its normalized added-line sequence (same content, same order —
  * order matters so a real reordering of statements is never mistaken for
@@ -317,17 +372,27 @@ function stripAllWhitespace(lines: string[]): string {
  * in practice, but) counts as formatting-only vacuously.
  *
  * That per-line check requires the same NUMBER of lines on each side, so it
- * misses a common formatter behavior: reflowing one line across several
- * (or several into one) with no token change, e.g. `return input.trim();`
- * wrapped onto two lines. As a fallback specifically for that case (only
- * reached when the per-line check already failed), compare the removed and
- * added blocks with ALL whitespace stripped rather than just normalized —
- * if the character sequences match exactly, the line-break placement is the
- * only difference. This does mean a change that ONLY affects whitespace
- * *inside* a token boundary (e.g. `"a  b"` -> `"a b"` in a string literal)
- * would also be misclassified as formatting-only; accepted as a rare,
- * low-stakes edge case for a mechanical pre-filter — see DECISIONS.md's
- * "Formatter-reflow detection" entry.
+ * misses two common formatter behaviors, both handled as fallbacks below
+ * (only reached when the per-line check already failed), by comparing the
+ * removed and added blocks with ALL whitespace stripped rather than just
+ * normalized:
+ *
+ * 1. Reflowing one line across several (or several into one) with no token
+ *    change, e.g. `return input.trim();` wrapped onto two lines — if the
+ *    character sequences match exactly once whitespace is gone, the
+ *    line-break placement is the only difference.
+ * 2. Wrapping a trailing expression in a redundant grouping-parenthesis
+ *    pair to break it across lines, e.g. `return greet(name);` ->
+ *    `return (\n  greet(name)\n);` — same idea, but the added `(`/`)`
+ *    means the whitespace-stripped sequences won't be byte-identical, so
+ *    `isRedundantExpressionWrap` checks for exactly that one-pair insertion
+ *    at a position where it's provably safe (see its own comment).
+ *
+ * Both fallbacks mean a change that ONLY affects whitespace *inside* a
+ * token boundary (e.g. `"a  b"` -> `"a b"` in a string literal) could also
+ * be misclassified as formatting-only; accepted as a rare, low-stakes edge
+ * case for a mechanical pre-filter — see DECISIONS.md's "Formatter-reflow
+ * detection" entry.
  */
 function isHunkFormattingOnly(hunk: DiffHunk): boolean {
   const removedLines = normalizedRemovedLines(hunk);
@@ -335,7 +400,9 @@ function isHunkFormattingOnly(hunk: DiffHunk): boolean {
   if (arraysEqual(removedLines, addedLines)) return true;
   const removedFlat = stripAllWhitespace(removedLines);
   const addedFlat = stripAllWhitespace(addedLines);
-  return removedFlat.length > 0 && removedFlat === addedFlat;
+  if (removedFlat.length === 0) return false;
+  if (removedFlat === addedFlat) return true;
+  return isRedundantExpressionWrap(removedFlat, addedFlat) || isRedundantExpressionWrap(addedFlat, removedFlat);
 }
 
 /** A file is formatting-only only if every one of its hunks is. */

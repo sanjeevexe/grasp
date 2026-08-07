@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 
 /**
  * Regression test for a real reliability bug an independent test pass
@@ -41,30 +41,43 @@ function initRepoWithInvalidConfig(): string {
   return repo;
 }
 
+/**
+ * Uses `spawnSync`, not `execFileSync`, deliberately: `execFileSync` only
+ * gives you `stdout`/`stderr` back when it throws (i.e. on a nonzero exit),
+ * which meant an earlier version of this helper hardcoded `stderr: ""` on
+ * the success path — silently discarding whatever the process actually
+ * wrote to stderr on a normal exit 0. That's exactly the kind of gap that
+ * would make a test claiming a hook "exits 0 quietly" pass whether or not
+ * it actually stayed quiet. `spawnSync` reports both streams regardless of
+ * exit code, so a real assertion on stderr content is possible even for the
+ * (intended, documented) exit-0-but-still-logs-a-diagnostic case.
+ */
 function runCli(args: string[], cwd: string, home: string, input?: string): { status: number | null; stdout: string; stderr: string } {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
-      cwd,
-      env: { ...process.env, HOME: home },
-      input: input ?? "",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return { status: 0, stdout: stdout.toString(), stderr: "" };
-  } catch (err) {
-    const e = err as { status: number | null; stdout: Buffer; stderr: Buffer };
-    return { status: e.status, stdout: e.stdout?.toString() ?? "", stderr: e.stderr?.toString() ?? "" };
-  }
+  const result = spawnSync(process.execPath, [CLI_PATH, ...args], {
+    cwd,
+    env: { ...process.env, HOME: home },
+    input: input ?? "",
+  });
+  return { status: result.status, stdout: result.stdout?.toString() ?? "", stderr: result.stderr?.toString() ?? "" };
 }
 
-test("internal:hook: an invalid .grasp.json exits 0 quietly instead of exiting 1 with a visible error", () => {
+test("internal:hook: an invalid .grasp.json exits 0 with no stdout hookOutput, but does write a diagnostic to stderr", () => {
   const repo = initRepoWithInvalidConfig();
   const home = mkTempDir("grasp-test-hook-cfgerr-home-");
 
   const payload = JSON.stringify({ session_id: "s1", hook_event_name: "PreToolUse", cwd: repo });
   const result = runCli(["internal:hook"], repo, home, payload);
 
+  // "Quiet" here means "exit 0, no hookOutput on stdout that could deny/alter
+  // the tool call" — NOT "silent." runInternalHook() deliberately still
+  // writes a diagnostic to stderr (src/cli.ts's catch block) so the failure
+  // isn't invisible to someone debugging, even though it must never fail the
+  // hook itself. Whether Claude Code surfaces stderr from a successful (exit
+  // 0) hook to the user is not something this test can verify without a real
+  // authenticated session — see the README/TESTING_GUIDE's noted blind spot.
   assert.equal(result.status, 0, `internal:hook must exit 0 even with an invalid repo config; got status=${result.status}, stderr=${result.stderr}`);
   assert.equal(result.stdout, "", "no hookOutput should be emitted when the hook errored out internally");
+  assert.match(result.stderr, /gateMod/, "the diagnostic should name the actual invalid config field, for anyone who does go looking");
 });
 
 test("internal:hook: same invalid config across PostToolUse and Stop also exits 0 quietly", () => {
