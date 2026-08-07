@@ -4,7 +4,7 @@
 **Command:** `grasp`
 **npm package name:** `grasp-cli` (bare `grasp` is already taken by an unrelated, dead package — publish under `grasp-cli`, alias the installed binary to `grasp` so the actual command stays clean)
 **Type:** Open-source terminal-native CLI tool
-**Status:** Ideation complete — ready for v1 build
+**Status:** Ideation complete — ready for v1 build *(historical: this is the original pre-build ideation doc. The build has since diverged from it in places the team judged during implementation — notably, questions surface via on-demand `grasp review` rather than being presented synchronously before the agent's final output, as `onSessionComplete` below still describes. See [BUILD_PLAN.md](BUILD_PLAN.md) and [README.md](README.md) for the as-built architecture, and [DECISIONS.md](DECISIONS.md) for the reasoning behind each divergence.)*
 **Primary goal:** Ship a genuinely useful, well-received open-source tool. Not a business.
 
 ---

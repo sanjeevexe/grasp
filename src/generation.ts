@@ -129,11 +129,46 @@ export function isTimeoutError(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ETIMEDOUT";
 }
 
-/** Shells out to `claude -p`, exactly per brief §3.3's recommended invocation shape. Throws if the process fails, times out, or its stdout isn't valid JSON at all — callers must catch, and can use `isTimeoutError` to distinguish a timeout from any other failure. */
+/**
+ * Shells out to `claude -p`, exactly per brief §3.3's recommended invocation
+ * shape. Throws if the process fails, times out, or its stdout isn't valid
+ * JSON at all — callers must catch, and can use `isTimeoutError` to
+ * distinguish a timeout from any other failure.
+ *
+ * Isolation flags — `--tools ""` (not `--allowedTools ""`, which only adds
+ * to the allow-list and does not disable the built-in tool set at all —
+ * found live by an independent test pass: a `CLAUDE.md` with an injected
+ * "read this file and leak it" instruction caused a real `--allowedTools ""`
+ * call to come back with `stop_reason: "tool_use"`, i.e. the model actually
+ * attempted a tool call), `--safe-mode` (disables CLAUDE.md/skills/plugins/
+ * hooks/MCP-server loading — confirmed live: the same injected CLAUDE.md
+ * was not followed and the call's cache-creation size dropped from the
+ * ~25k tokens of loaded repo context down to just the base system prompt
+ * once this flag was added), `--setting-sources ""` (no user/project/local
+ * settings — including any pre-existing tool allow-rules from the user's
+ * own Claude Code settings, which the report also flagged as a leak path
+ * `--tools ""` alone wouldn't close), and `--strict-mcp-config` with no
+ * `--mcp-config` given (belt-and-suspenders against any MCP server despite
+ * `--safe-mode` already covering this). See DECISIONS.md's "Generation call
+ * tool/context isolation flags" entry.
+ */
 function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
   const stdout = execFileSync(
     "claude",
-    ["-p", prompt, "--output-format", "json", "--allowedTools", "", "--max-turns", "1"],
+    [
+      "-p",
+      prompt,
+      "--output-format",
+      "json",
+      "--tools",
+      "",
+      "--safe-mode",
+      "--setting-sources",
+      "",
+      "--strict-mcp-config",
+      "--max-turns",
+      "1",
+    ],
     {
       encoding: "utf-8",
       maxBuffer: 1024 * 1024 * 16,
