@@ -250,6 +250,8 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
               />
               {phase !== "skip-reason" && inputValue.trim().length === 0 ? (
                 <Text color="yellow">A blank answer isn't accepted — type something, or press Esc to skip instead.</Text>
+              ) : phase === "skip-reason" ? (
+                <Text dimColor>[Enter] submit (blank = no reason given)   (terminal: {columns}x{rows})</Text>
               ) : (
                 <Text dimColor>[Enter] submit   [Esc] skip this question   (terminal: {columns}x{rows})</Text>
               )}

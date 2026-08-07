@@ -167,6 +167,29 @@ test("runGeneration: a missing total_cost_usd on an otherwise-successful respons
   db.close();
 });
 
+test("runGeneration: a negative total_cost_usd is rejected, not summed into the session cap total", () => {
+  const db = openStore(tempDbPath());
+  const params = baseParams();
+  let outcome: ReturnType<typeof runGeneration> | undefined;
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "negative-cost" }, () => {
+    outcome = runGeneration(db, params);
+  });
+
+  assert.equal(outcome!.missReason, "error");
+  assert.equal(outcome!.questionType, null);
+
+  const row = db.prepare("SELECT cost_usd, question_type, miss_reason FROM events WHERE id = ?").get(outcome!.eventId) as any;
+  assert.equal(row.cost_usd, null, "a negative cost figure must be treated as unknown (NULL), never stored as-is");
+  assert.equal(row.question_type, null);
+  assert.equal(row.miss_reason, "error");
+
+  // The session's cumulative cost must not go negative from this response —
+  // that would let later calls see artificial room under the cost cap.
+  assert.equal(getSessionCostUsd(db, params.sessionId), 0);
+  db.close();
+});
+
 test("runGeneration: a well-formed error envelope (is_error: true) is a miss, cost still recorded when present", () => {
   const db = openStore(tempDbPath());
   const params = baseParams();

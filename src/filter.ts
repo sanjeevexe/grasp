@@ -120,6 +120,12 @@ function parseHunkNewFileStartLine(header: string): number | null {
   return match ? parseInt(match[1], 10) : null;
 }
 
+/** Extracts the old-file starting line number `a` from a hunk header of the form `@@ -a[,b] +c[,d] @@`. Returns null if the header doesn't match the expected shape. */
+function parseHunkOldFileStartLine(header: string): number | null {
+  const match = header.match(/^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 /**
  * True if a generated-file marker appears among the diff's added lines
  * AND that line falls within the first `GENERATED_FILE_HEADER_LINE_LIMIT`
@@ -161,6 +167,39 @@ function markerLineMatches(rawLine: string): boolean {
 }
 
 function isFileGeneratedFromDiff(file: DiffFile): boolean {
+  // A deleted file has no resulting NEW file for the marker to live in —
+  // walk the OLD-file line numbers over the removed lines instead. Found by
+  // an independent test pass: deleting a tracked generated file (a normal
+  // generator operation — regenerating obsolete output) previously reached
+  // Claude uncaught, since this function only ever looked at ADDED lines and
+  // `isFileGeneratedOnDisk` deliberately returns false once the file no
+  // longer exists on disk. See DECISIONS.md's "Generated-file detection:
+  // deletion case" entry.
+  if (file.status === "deleted") {
+    for (const h of file.hunks) {
+      const startLine = parseHunkOldFileStartLine(h.header);
+      if (startLine === null || startLine > GENERATED_FILE_HEADER_LINE_LIMIT) continue;
+
+      let lineNo = startLine;
+      for (const line of h.lines) {
+        if (line.startsWith("-") && !line.startsWith("---")) {
+          if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT && markerLineMatches(line.slice(1))) {
+            return true;
+          }
+          lineNo++;
+        } else if (line.startsWith("+") && !line.startsWith("+++")) {
+          // Added lines don't exist in the old file — they don't advance
+          // the old-file line counter.
+        } else {
+          // Context line: present in both old and new file, advances the
+          // old-file counter too.
+          lineNo++;
+        }
+      }
+    }
+    return false;
+  }
+
   for (const h of file.hunks) {
     const startLine = parseHunkNewFileStartLine(h.header);
     if (startLine === null || startLine > GENERATED_FILE_HEADER_LINE_LIMIT) continue;

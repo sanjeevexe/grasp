@@ -37,7 +37,7 @@ npm install -g grasp-cli
 
 (`grasp-cli` is the npm package name — `grasp` is already taken by an unrelated, dead package — but the installed command is `grasp`.)
 
-**Requirement:** Grasp generates questions by shelling out to your own `claude` CLI in headless mode (`claude -p ... --output-format json`). You need Claude Code installed and authenticated (subscription or API) for question generation to work at all. Everything else in Grasp — capture, filtering, storage, `grasp review` — works without it; only generation depends on it.
+**Requirements:** Node `>=22` (Grasp's own `engines` field, and also the floor its `better-sqlite3` dependency requires — `npm install` will fail on an older Node). Grasp generates questions by shelling out to your own `claude` CLI in headless mode (`claude -p ... --output-format json`), so you also need Claude Code installed and authenticated (subscription or API) for question generation to work at all. Everything else in Grasp — capture, filtering, storage, `grasp review` — works without it; only generation depends on it.
 
 ## Setting up a repo
 
@@ -65,7 +65,7 @@ This opens an interactive terminal view of every question you haven't answered o
 
 Grasp reads your code and sends diffs to an LLM to generate questions. That's worth being direct about:
 
-- **What's sent:** only the filtered, "significant" part of a diff (lockfiles, generated files, formatting-only changes, and anything under a size floor are excluded before generation ever runs) plus a list of programming concepts you've already answered questions about (so Grasp doesn't re-teach you the same thing). No full-repo access, no file reads beyond what's in the diff — Grasp explicitly runs the generation call with all tool access disabled.
+- **What's sent:** only the filtered, "significant" part of a diff (lockfiles, generated files, formatting-only changes, and anything under a size floor are excluded before generation ever runs) plus a list of programming concepts you've already answered questions about (so Grasp doesn't re-teach you the same thing). No full-repo access, and no file contents beyond that diff are ever sent to Claude — Grasp explicitly runs the generation call with all tool access disabled. (To catch a generated file whose header wasn't touched by the current diff, the filter does read up to 4KB off the start of each changed file on disk — that local check never leaves your machine or gets sent anywhere.)
 - **Where it's sent:** to `claude -p`, i.e. your own already-configured Claude Code session. This is not a separate API key, not a hosted Grasp backend, and nothing goes to Grasp's maintainer — there is no telemetry, ever.
 - **What it costs:** if you're on a Claude subscription, this spends your existing rate-limit headroom. If you're API-billed, it's real (small) dollars — each question-generation call is typically a fraction of a cent. Grasp tracks cumulative spend per Claude Code session and stops generating once a configurable cap is hit (default $0.25/session). You'll see a running total in the `Stop` message after a session that spent anything ("$0.0043 spent generating comprehension questions this session so far").
 - **What's stored, and where:** everything Grasp logs — diffs, questions, your answers, costs, skip reasons — lives in a plain SQLite database at `~/.grasp/history.db`. It's not obfuscated; you can inspect it directly with `sqlite3 ~/.grasp/history.db ".schema"` or any SQLite browser. Nothing leaves your machine except the generation calls described above.

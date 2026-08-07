@@ -153,8 +153,17 @@ function invokeClaudeJudge(prompt: string): ClaudeEnvelope {
     }
   );
   const envelope = JSON.parse(stdout);
+  const rawCost = envelope.total_cost_usd;
+  // A negative or non-finite cost is malformed, not a real spend figure —
+  // found by an independent test pass: a mock response reporting
+  // `total_cost_usd: -0.5` was accepted at face value and summed into the
+  // session's cap total, letting a malformed response manufacture artificial
+  // room under the cost cap it's supposed to enforce. Treated identically to
+  // a missing cost figure (null, "genuinely unknown") rather than coerced or
+  // clamped — see DECISIONS.md's "Negative/non-finite cost rejected" entry.
+  const totalCostUsd = typeof rawCost === "number" && Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : null;
   return {
-    totalCostUsd: typeof envelope.total_cost_usd === "number" ? envelope.total_cost_usd : null,
+    totalCostUsd,
     resultText: typeof envelope.result === "string" ? envelope.result : "",
     isError: Boolean(envelope.is_error),
   };

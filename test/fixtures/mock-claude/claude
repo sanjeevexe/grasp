@@ -68,6 +68,20 @@ if (mode === "missing-cost") {
   process.exit(0);
 }
 
+if (mode === "negative-cost") {
+  // A malformed envelope reporting a negative cost — used by
+  // test/caps.test.ts to prove a negative total_cost_usd can't manufacture
+  // artificial room under the session cost cap.
+  const result = {
+    worthAsking: true,
+    conceptTag: "negative-cost-tag",
+    questionConcept: "concept q",
+    questionInstance: "instance q",
+  };
+  process.stdout.write(JSON.stringify({ total_cost_usd: -0.5, result: JSON.stringify(result), is_error: false }));
+  process.exit(0);
+}
+
 // mode === "normal": always worth asking, fresh concept tag per call (via a
 // counter file) so memoization never suppresses the concept question.
 const counterPath = process.env.GRASP_TEST_MOCK_COUNTER;
