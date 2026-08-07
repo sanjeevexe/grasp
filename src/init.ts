@@ -5,10 +5,14 @@ import * as readline from "readline";
 const HOOK_COMMAND = "grasp internal:hook";
 // PostToolUse now runs Phase 5's synchronous `claude -p` judge+generate
 // call inline, which the original Phase 3 default (15s) didn't anticipate
-// and could plausibly cut off before a real headless call completes. 45s
-// isn't a Phase 6 "defensive timeout on the subprocess call itself" (that's
-// still unbuilt — this is just the outer Claude Code hook timeout that
-// already existed, sized to fit what now runs inside it).
+// and could plausibly cut off before a real headless call completes. This
+// is the outer Claude Code hook timeout, distinct from the inner subprocess
+// timeout on the `claude -p` call itself (`GENERATION_TIMEOUT_MS`,
+// src/generation.ts) — both exist, sized with margin against each other and
+// against this value; see generation.ts's `TOTAL_CALL_BUDGET_MS` comment for
+// how a single generation call's whole wall-clock budget, including time
+// spent waiting on another overlapping call for the same session, is kept
+// under this number.
 const HOOK_TIMEOUT_SECONDS = 45;
 const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"] as const;
 type HookEventName = (typeof HOOK_EVENTS)[number];

@@ -101,6 +101,17 @@ const GENERATED_FILE_MARKERS: RegExp[] = [
  */
 const GENERATED_FILE_HEADER_LINE_LIMIT = 5;
 
+/**
+ * Common single-line comment openers across the languages Grasp is likely to
+ * see (`//`, `#`, `--`, `;`, `%`), C-style block-comment delimiters (`/*`,
+ * `*` for a continuation line), HTML/XML (`<!--`), and Python/doc-string
+ * triple quotes. A marker phrase is only treated as a generated-file
+ * declaration when it appears on a line that is itself a comment (or
+ * docstring) opener — see `isFileGenerated`'s own comment for why this
+ * check exists.
+ */
+const COMMENT_LINE_PATTERN = /^(\/\/|\/\*|\*|#|--|;|%|<!--|"""|''')/;
+
 /** Extracts the new-file starting line number `c` from a hunk header of the form `@@ -a[,b] +c[,d] @@`. Returns null if the header doesn't match the expected shape. */
 function parseHunkNewFileStartLine(header: string): number | null {
   const match = header.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
@@ -129,6 +140,18 @@ function parseHunkNewFileStartLine(header: string): number | null {
  * whose header start is already past that window is skipped entirely
  * without inspecting its content, so a change deep in an existing file can
  * never trigger this regardless of what its first few added lines say.
+ *
+ * A second, independent false positive found by an independent test pass:
+ * even restricted to the file's first 5 lines, an ordinary short file's
+ * real code can contain marker phrasing that has nothing to do with a
+ * generator declaring the file machine-written, e.g. a 5-line file whose
+ * third line is `throw new Error("Do not edit locked state")` — an
+ * executable runtime guard, not a header comment. The generator convention
+ * these markers actually rely on (protobuf/gRPC, OpenAPI, ORMs, `git`
+ * itself) is a COMMENT at the top of the file, so a marker only counts when
+ * the line it appears on is itself a comment/docstring opener (see
+ * `COMMENT_LINE_PATTERN`) — ordinary strings and executable statements
+ * near the top of a small file can no longer suppress a real question.
  */
 export function isFileGenerated(file: DiffFile): boolean {
   for (const h of file.hunks) {
@@ -140,7 +163,10 @@ export function isFileGenerated(file: DiffFile): boolean {
       if (line.startsWith("+") && !line.startsWith("+++")) {
         if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT) {
           const content = line.slice(1);
-          if (GENERATED_FILE_MARKERS.some((re) => re.test(content))) return true;
+          const trimmed = content.trim();
+          if (COMMENT_LINE_PATTERN.test(trimmed) && GENERATED_FILE_MARKERS.some((re) => re.test(content))) {
+            return true;
+          }
         }
         lineNo++;
       } else if (line.startsWith("-") && !line.startsWith("---")) {

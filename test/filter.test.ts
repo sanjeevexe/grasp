@@ -168,6 +168,29 @@ test("isFileGenerated: true when the marker is in the first hunk's early NEW-fil
   assert.equal(isFileGenerated(f), true);
 });
 
+// Regression coverage for a second false positive an independent test pass
+// found in the SAME position-in-file window the fix above closes: an
+// ordinary short file whose marker-phrase text falls within the first 5
+// lines of the FILE (not just the diff) but isn't a comment at all — a real
+// executable statement, not a generator's header declaration.
+test("isFileGenerated: false when marker text appears in the header window but not on a comment line", () => {
+  const f = diffFile({
+    path: "src/state.ts",
+    insertions: 3,
+    deletions: 0,
+    hunks: [
+      hunk("@@ -1,2 +1,5 @@", [
+        " export function assertWritable(locked) {",
+        "+  if (locked) {",
+        '+    throw new Error("Do not edit locked state");',
+        "+  }",
+        " }",
+      ]),
+    ],
+  });
+  assert.equal(isFileGenerated(f), false);
+});
+
 // --- evaluateCapturedDiff --------------------------------------------------
 
 function bigHunk(prefix: "+" | "-", n: number) {

@@ -4,10 +4,13 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
+  GENERATION_RESERVATION_STALE_MS,
   getBlockingPendingQuestionsForSession,
   getPendingQuestionsForSession,
   insertEvent,
   openStore,
+  releaseGenerationSlot,
+  tryClaimGenerationSlot,
 } from "../src/store";
 
 function tempDbPath(): string {
@@ -77,5 +80,64 @@ test("getBlockingPendingQuestionsForSession: a different session's pending quest
   const recent = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
   seedPendingQuestion(db, "other-session", recent);
   assert.equal(getBlockingPendingQuestionsForSession(db, "this-session", now).length, 0);
+  db.close();
+});
+
+// --- generation reservation ownership token ---------------------------------
+//
+// Regression coverage for the "stale worker's release steals a live
+// reservation" race an independent test pass found: releaseGenerationSlot
+// used to delete "whatever row is there for this session_id" unconditionally,
+// with no check that the caller releasing it was actually the one currently
+// holding it. A worker that paused past GENERATION_RESERVATION_STALE_MS
+// (machine sleep, process suspension) and then resumed would find its
+// reservation already stolen by a second worker; the first worker's own
+// unconditional release would then delete the SECOND worker's still-active
+// reservation out from under it.
+
+test("releaseGenerationSlot: a stale worker's release does not delete a newer worker's reservation it already stole", () => {
+  const db = openStore(tempDbPath());
+  const sessionId = "reservation-race-session";
+
+  const tokenA = tryClaimGenerationSlot(db, sessionId);
+  assert.ok(tokenA, "worker A should claim the free slot");
+
+  // Simulate worker A having genuinely paused past the staleness window.
+  db.prepare(`UPDATE generation_reservations SET claimed_at = ? WHERE session_id = ?`).run(
+    new Date(Date.now() - GENERATION_RESERVATION_STALE_MS - 1000).toISOString(),
+    sessionId
+  );
+
+  const tokenB = tryClaimGenerationSlot(db, sessionId);
+  assert.ok(tokenB, "worker B should be able to steal the now-stale slot");
+  assert.notEqual(tokenB, tokenA, "worker B's token must differ from worker A's");
+
+  // Worker A resumes and releases using its OWN (now-stale) token.
+  releaseGenerationSlot(db, sessionId, tokenA as string);
+
+  const stillHeldByB = db
+    .prepare(`SELECT token FROM generation_reservations WHERE session_id = ?`)
+    .get(sessionId) as { token: string } | undefined;
+  assert.equal(stillHeldByB?.token, tokenB, "worker B's reservation must survive worker A's stale release");
+
+  // Worker B finishes normally and releases with its real token.
+  releaseGenerationSlot(db, sessionId, tokenB as string);
+  const gone = db.prepare(`SELECT token FROM generation_reservations WHERE session_id = ?`).get(sessionId);
+  assert.equal(gone, undefined, "a real release with the current token must clear the row");
+
+  db.close();
+});
+
+test("tryClaimGenerationSlot: returns null (not a live claim) while another process holds a fresh reservation", () => {
+  const db = openStore(tempDbPath());
+  const sessionId = "reservation-contention-session";
+
+  const token = tryClaimGenerationSlot(db, sessionId);
+  assert.ok(token);
+  assert.equal(tryClaimGenerationSlot(db, sessionId), null);
+
+  releaseGenerationSlot(db, sessionId, token as string);
+  assert.ok(tryClaimGenerationSlot(db, sessionId), "slot should be claimable again after a real release");
+
   db.close();
 });

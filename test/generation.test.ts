@@ -3,8 +3,15 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { buildDiffSummary, isTimeoutError, parseJudgeResponse, runGeneration, GenerationParams } from "../src/generation";
-import { openStore, getConceptTagGlobal } from "../src/store";
+import {
+  acquireGenerationSlot,
+  buildDiffSummary,
+  isTimeoutError,
+  parseJudgeResponse,
+  runGeneration,
+  GenerationParams,
+} from "../src/generation";
+import { openStore, getConceptTagGlobal, releaseGenerationSlot, tryClaimGenerationSlot } from "../src/store";
 import { diffFile, testConfig } from "./helpers";
 
 // --- parseJudgeResponse: the judge+generate response contract -------------
@@ -236,3 +243,51 @@ test("buildDiffSummary: multiple files, summed insertions/deletions, comma-joine
 test("buildDiffSummary: zero files", () => {
   assert.equal(buildDiffSummary([]), "0 files changed (+0/-0): ");
 });
+
+// --- acquireGenerationSlot ---------------------------------------------------
+//
+// Regression coverage for the "queued generation calls exceed the outer hook
+// timeout" bug an independent test pass found: the slot-wait deadline used
+// to be sized purely off the reservation's staleness window, with no regard
+// for how long the CALLER's own subsequent generation call still had left to
+// run, so a queued caller could still be in-flight (or dead) when Claude
+// Code's own 45s hook timeout killed the whole process with nothing
+// recorded. runGeneration's own deadline is derived from hardcoded
+// multi-second constants (TOTAL_CALL_BUDGET_MS/GENERATION_TIMEOUT_MS) not
+// worth waiting out in a fast unit test — these tests instead exercise
+// acquireGenerationSlot directly with small, explicit deadlines to pin its
+// actual contract: succeed immediately if free, succeed once freed before
+// the deadline, give up (return null) once the deadline passes.
+
+test("acquireGenerationSlot: succeeds immediately when the slot is free", () => {
+  const db = openStore(tempDbPath());
+  const token = acquireGenerationSlot(db, "slot-session", Date.now() + 1000);
+  assert.ok(token);
+  db.close();
+});
+
+test("acquireGenerationSlot: gives up (returns null) once the deadline passes while another holder is live", () => {
+  const db = openStore(tempDbPath());
+  const holderToken = tryClaimGenerationSlot(db, "slot-session");
+  assert.ok(holderToken, "setup: first claim must succeed");
+
+  const start = Date.now();
+  const result = acquireGenerationSlot(db, "slot-session", start + 250);
+  const elapsed = Date.now() - start;
+
+  assert.equal(result, null, "must give up once its own deadline passes, not wait out the full staleness window");
+  assert.ok(elapsed < 2000, `should give up close to its 250ms deadline, took ${elapsed}ms`);
+
+  releaseGenerationSlot(db, "slot-session", holderToken as string);
+  db.close();
+});
+
+// A test for "acquires once a prior holder releases, before its own
+// deadline" needs a SEPARATE process to do that release, not a same-process
+// setTimeout/thread — acquireGenerationSlot's poll loop blocks the whole
+// thread synchronously (Atomics.wait), same as the real generation call it
+// guards, so nothing else on this thread (including a timer callback) can
+// run until it returns. The real multi-process regression tests in
+// test/generationCapRace.test.ts already exercise exactly this path end to
+// end (each of 6 real OS-process workers acquires only after an earlier one
+// releases, well within its deadline) — see that file's own comment.

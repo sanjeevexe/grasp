@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import * as fs from "fs";
+import { randomUUID } from "crypto";
 import { DB_PATH, GRASP_HOME } from "./paths";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
 import { ConceptTagGlobalRow, ConceptTagRecord, EventRecord } from "./types";
@@ -113,7 +114,8 @@ const SCHEMA_SQL = `
   -- "Atomic cap enforcement: per-session generation reservation" entry.
   CREATE TABLE IF NOT EXISTS generation_reservations (
     session_id TEXT PRIMARY KEY,
-    claimed_at TEXT NOT NULL
+    claimed_at TEXT NOT NULL,
+    token TEXT NOT NULL
   );
 `;
 
@@ -149,6 +151,20 @@ function migrateSchema(db: Database.Database): void {
   // above is skipped, but the index still needs creating exactly once —
   // IF NOT EXISTS makes this safe to run every time regardless of path.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id)`);
+
+  const reservationColumns = db.prepare(`PRAGMA table_info(generation_reservations)`).all() as Array<{
+    name: string;
+  }>;
+  if (!reservationColumns.some((c) => c.name === "token")) {
+    // NOT NULL requires a DEFAULT for SQLite's ADD COLUMN on a non-empty
+    // table. An empty-string token can never match a real claimer's own
+    // (non-empty, randomly generated) token, so any reservation row that
+    // predates this migration simply can't be released by ownership check —
+    // it can only be reclaimed once genuinely stale, same self-heal path as
+    // any other abandoned reservation. See tryClaimGenerationSlot/
+    // releaseGenerationSlot's own comments for why ownership matters at all.
+    db.exec(`ALTER TABLE generation_reservations ADD COLUMN token TEXT NOT NULL DEFAULT ''`);
+  }
 }
 
 /**
@@ -673,15 +689,21 @@ export function getCapturedDiffsForTurn(
 export const GENERATION_RESERVATION_STALE_MS = 45_000;
 
 /**
- * Attempts to claim the single generation slot for `sessionId`. Returns
- * true if claimed (no other process holds it, or the holder's claim is
- * older than `GENERATION_RESERVATION_STALE_MS` and gets stolen), false if
- * another process currently holds a live claim. The read-check-write is one
- * `BEGIN IMMEDIATE` transaction so two processes racing this call can't both
- * see "no live claim" and both write — only the loser sees SQLite's own
+ * Attempts to claim the single generation slot for `sessionId`. Returns a
+ * fresh, randomly generated ownership token if claimed (no other process
+ * holds it, or the holder's claim is older than
+ * `GENERATION_RESERVATION_STALE_MS` and gets stolen), or null if another
+ * process currently holds a live claim. The read-check-write is one `BEGIN
+ * IMMEDIATE` transaction so two processes racing this call can't both see
+ * "no live claim" and both write — only the loser sees SQLite's own
  * write-lock contention, not a logic race.
+ *
+ * The caller must hold onto this token and pass the SAME one back to
+ * `releaseGenerationSlot` — see that function's comment for why a bare
+ * "delete whatever's there for this session_id" isn't safe.
  */
-export function tryClaimGenerationSlot(db: Database.Database, sessionId: string): boolean {
+export function tryClaimGenerationSlot(db: Database.Database, sessionId: string): string | null {
+  const token = randomUUID();
   const run = db.transaction(() => {
     const now = new Date();
     const existing = db
@@ -690,21 +712,35 @@ export function tryClaimGenerationSlot(db: Database.Database, sessionId: string)
     if (existing) {
       const age = now.getTime() - new Date(existing.claimed_at).getTime();
       if (age < GENERATION_RESERVATION_STALE_MS) {
-        return false;
+        return null;
       }
     }
     db.prepare(
-      `INSERT INTO generation_reservations (session_id, claimed_at) VALUES (?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET claimed_at = excluded.claimed_at`
-    ).run(sessionId, now.toISOString());
-    return true;
+      `INSERT INTO generation_reservations (session_id, claimed_at, token) VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET claimed_at = excluded.claimed_at, token = excluded.token`
+    ).run(sessionId, now.toISOString(), token);
+    return token;
   });
   return run.immediate();
 }
 
-/** Releases this session's generation slot, if held. Safe to call even if the slot was already stolen as stale (e.g. an unusually slow call) — just deletes whatever row is there, never asserts ownership by a token, since only one process is ever meant to legitimately hold it. */
-export function releaseGenerationSlot(db: Database.Database, sessionId: string): void {
-  db.prepare(`DELETE FROM generation_reservations WHERE session_id = ?`).run(sessionId);
+/**
+ * Releases this session's generation slot, but ONLY if it's still held by
+ * `token` — the exact value this caller got back from its own
+ * `tryClaimGenerationSlot` call. Without this check, a worker that pauses
+ * (machine sleep, process suspension) past `GENERATION_RESERVATION_STALE_MS`
+ * and then resumes could find its reservation already stolen by a second
+ * worker; its own (unconditional, "just delete whatever's there") release
+ * would then delete that second worker's ACTIVE reservation out from under
+ * it, letting a third worker claim the slot while the second is still
+ * genuinely running — defeating the whole point of the mutex. Found by an
+ * independent test pass. Matching on token makes a stale worker's release a
+ * no-op once it no longer owns the row, which is exactly what should
+ * happen — see DECISIONS.md's "Generation reservation ownership token"
+ * entry.
+ */
+export function releaseGenerationSlot(db: Database.Database, sessionId: string, token: string): void {
+  db.prepare(`DELETE FROM generation_reservations WHERE session_id = ? AND token = ?`).run(sessionId, token);
 }
 
 /** Append-only audit row — every observed hook firing, regardless of what (if anything) it did. */

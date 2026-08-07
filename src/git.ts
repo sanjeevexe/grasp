@@ -34,6 +34,18 @@ export function runGit(
       encoding: "utf-8",
       maxBuffer: 1024 * 1024 * 64,
       env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+      // Explicit, not the execFileSync default: Node's exec-family helpers
+      // send a failing child's stderr straight to the PARENT's stderr by
+      // default (only stdout is piped/captured for the return value) — the
+      // same quirk documented in generation.ts's invokeClaudeJudge. Left at
+      // the default here, an EXPECTED git failure this module deliberately
+      // probes for and recovers from (e.g. `rev-parse --verify HEAD` in a
+      // repo with no commits yet, see resolveBaseRef) printed git's raw
+      // "fatal: ..." line to the user as if something had actually broken,
+      // even though Grasp's own fallback made the call succeed. Piping
+      // stderr instead means it's only ever available via the caught
+      // error's `.stderr`, used below to build a real failure's message.
+      stdio: ["ignore", "pipe", "pipe"],
     });
     return { stdout, status: 0 };
   } catch (err: any) {

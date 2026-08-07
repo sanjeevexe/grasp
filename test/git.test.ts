@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { execFileSync } from "child_process";
-import { isMissingGitObjectError, resolveRepoRoot, runGit } from "../src/git";
+import { execFileSync, spawnSync } from "child_process";
+import { EMPTY_TREE_HASH, isMissingGitObjectError, resolveRepoRoot, runGit } from "../src/git";
 
 function mkTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -89,4 +89,36 @@ test("isMissingGitObjectError: false for an unrelated git failure", () => {
 
 test("isMissingGitObjectError: false for a plain Error unrelated to git", () => {
   assert.equal(isMissingGitObjectError(new Error("something else entirely")), false);
+});
+
+// --- runGit stderr isolation ------------------------------------------------
+//
+// Regression coverage for the "expected git failure leaks to the user" bug
+// an independent test pass found: `resolveBaseRef`'s `rev-parse --verify
+// HEAD` probe is EXPECTED to fail in a brand-new repo with no commits yet
+// (that's how it decides to fall back to git's empty-tree hash), but
+// `runGit`'s underlying `execFileSync` call left stderr on Node's default
+// (inherited) setting, so git's own "fatal: Needed a single revision"
+// message printed straight to the real process's stderr as if something had
+// actually gone wrong, even though the call succeeded end to end. This has
+// to be checked from a REAL child process (not by calling runGit in-process
+// and inspecting the caught error), since the leak is specifically about
+// what got written to the process's own stderr stream, independent of
+// whatever the error object itself carries.
+
+const GIT_STDERR_FIXTURE = path.resolve(process.cwd(), "test-dist/test/fixtures/gitStderrWorker.js");
+
+test("runGit: an expected git failure (no commits yet) never leaks to the process's own stderr", () => {
+  assert.ok(
+    fs.existsSync(GIT_STDERR_FIXTURE),
+    `compiled fixture not found at ${GIT_STDERR_FIXTURE} — run \`npm test\` (which builds test-dist first)`
+  );
+  const repo = mkTempDir("grasp-test-no-commits-");
+  git(repo, ["init", "-q"]);
+
+  const result = spawnSync(process.execPath, [GIT_STDERR_FIXTURE, repo], { encoding: "utf-8" });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.trim(), EMPTY_TREE_HASH);
+  assert.equal(result.stderr.trim(), "", `expected no stderr output, got: ${result.stderr}`);
 });
