@@ -152,7 +152,14 @@ export async function runInit(repoRoot: string): Promise<void> {
     messageLines.push(
       `Grasp will add the following hook(s) to ${settingsPath}:`,
       "",
-      JSON.stringify({ hooks: Object.fromEntries(missing.map((e) => [e, DESIRED[e]])) }, null, 2),
+      // Each event's value in the actual settings file is an ARRAY of hook
+      // entries (Claude Code's own schema — see HooksSection above), even
+      // though DESIRED[e] here is a single entry. Wrapping it in [...] for
+      // the preview is what makes this match the JSON shape actually
+      // written below, rather than showing a bare object a reader could
+      // paste in and get wrong — see DECISIONS.md's "grasp init preview
+      // must match written JSON shape" entry.
+      JSON.stringify({ hooks: Object.fromEntries(missing.map((e) => [e, [DESIRED[e]]])) }, null, 2),
       ""
     );
   }
@@ -165,8 +172,8 @@ export async function runInit(repoRoot: string): Promise<void> {
     for (const eventName of stale) {
       messageLines.push(
         `  ${eventName}:`,
-        `    before: ${JSON.stringify(staleBefore.get(eventName))}`,
-        `    after:  ${JSON.stringify(DESIRED[eventName])}`,
+        `    before: ${JSON.stringify([staleBefore.get(eventName)])}`,
+        `    after:  ${JSON.stringify([DESIRED[eventName]])}`,
         ""
       );
     }

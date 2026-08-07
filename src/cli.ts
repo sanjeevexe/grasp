@@ -371,6 +371,20 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0];
 
+  // internal:hook must never let ensureInitialized's config validation
+  // (which can throw on a malformed .grasp.json) escape to this function's
+  // own top-level catch below, which sets exitCode = 1 — that would make
+  // Claude Code show a hook-error notice on every firing until the config
+  // is fixed, contradicting runInternalHook's own "never exit nonzero"
+  // contract. runInternalHook() does its own initialization (openStore(),
+  // loadConfig() where actually needed) inside its all-swallowing try/catch,
+  // so it doesn't need ensureInitialized() run ahead of it. See
+  // DECISIONS.md's "internal:hook must not run ensureInitialized" entry.
+  if (command === "internal:hook") {
+    await runInternalHook();
+    return;
+  }
+
   ensureInitialized(process.cwd());
 
   if (command === undefined || command === "--help" || command === "-h") {
@@ -395,11 +409,6 @@ async function main(): Promise<void> {
 
   if (command === "debug:answer") {
     runDebugAnswer(args[1]);
-    return;
-  }
-
-  if (command === "internal:hook") {
-    await runInternalHook();
     return;
   }
 

@@ -1,3 +1,5 @@
+import * as fs from "fs";
+import * as path from "path";
 import { CapturedDiff, DiffFile, DiffHunk } from "./adapters/agentAdapter";
 import { BASELINE_IGNORE_PATTERNS } from "./ignoreBaseline";
 import { GraspConfig } from "./types";
@@ -97,7 +99,7 @@ const GENERATED_FILE_MARKERS: RegExp[] = [
  * to appear within to count. These markers conventionally live in a header
  * comment at the very top of a file (see e.g. the protoc-gen-ts example
  * above) — this is a position-in-the-FILE check, not a position-in-the-diff
- * one; see `isFileGenerated`'s own comment for why that distinction matters.
+ * one; see `isFileGeneratedFromDiff`'s own comment for why that distinction matters.
  */
 const GENERATED_FILE_HEADER_LINE_LIMIT = 5;
 
@@ -107,7 +109,7 @@ const GENERATED_FILE_HEADER_LINE_LIMIT = 5;
  * `*` for a continuation line), HTML/XML (`<!--`), and Python/doc-string
  * triple quotes. A marker phrase is only treated as a generated-file
  * declaration when it appears on a line that is itself a comment (or
- * docstring) opener — see `isFileGenerated`'s own comment for why this
+ * docstring) opener — see `isFileGeneratedFromDiff`'s own comment for why this
  * check exists.
  */
 const COMMENT_LINE_PATTERN = /^(\/\/|\/\*|\*|#|--|;|%|<!--|"""|''')/;
@@ -153,7 +155,12 @@ function parseHunkNewFileStartLine(header: string): number | null {
  * `COMMENT_LINE_PATTERN`) — ordinary strings and executable statements
  * near the top of a small file can no longer suppress a real question.
  */
-export function isFileGenerated(file: DiffFile): boolean {
+function markerLineMatches(rawLine: string): boolean {
+  const trimmed = rawLine.trim();
+  return COMMENT_LINE_PATTERN.test(trimmed) && GENERATED_FILE_MARKERS.some((re) => re.test(rawLine));
+}
+
+function isFileGeneratedFromDiff(file: DiffFile): boolean {
   for (const h of file.hunks) {
     const startLine = parseHunkNewFileStartLine(h.header);
     if (startLine === null || startLine > GENERATED_FILE_HEADER_LINE_LIMIT) continue;
@@ -161,12 +168,8 @@ export function isFileGenerated(file: DiffFile): boolean {
     let lineNo = startLine;
     for (const line of h.lines) {
       if (line.startsWith("+") && !line.startsWith("+++")) {
-        if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT) {
-          const content = line.slice(1);
-          const trimmed = content.trim();
-          if (COMMENT_LINE_PATTERN.test(trimmed) && GENERATED_FILE_MARKERS.some((re) => re.test(content))) {
-            return true;
-          }
+        if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT && markerLineMatches(line.slice(1))) {
+          return true;
         }
         lineNo++;
       } else if (line.startsWith("-") && !line.startsWith("---")) {
@@ -180,6 +183,56 @@ export function isFileGenerated(file: DiffFile): boolean {
     }
   }
   return false;
+}
+
+/** How many bytes from the start of a file are read to look for a header marker — comfortably more than GENERATED_FILE_HEADER_LINE_LIMIT lines' worth even for long lines, without reading an entire (possibly huge) generated file into memory. */
+const HEADER_READ_BYTES = 4096;
+
+/**
+ * Reads the first `GENERATED_FILE_HEADER_LINE_LIMIT` lines of `absPath` off
+ * disk, or null if the file can't be read (doesn't exist, deleted,
+ * permissions, etc — never throws).
+ */
+function readFileHeaderLines(absPath: string): string[] | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(absPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buffer = Buffer.alloc(HEADER_READ_BYTES);
+    const bytesRead = fs.readSync(fd, buffer, 0, HEADER_READ_BYTES, 0);
+    return buffer.toString("utf-8", 0, bytesRead).split(/\r\n|\r|\n/).slice(0, GENERATED_FILE_HEADER_LINE_LIMIT);
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Checks the CURRENT on-disk file (not the diff) for a header marker.
+ * Fixes a release-blocking gap an independent test pass found: the
+ * diff-only check above only sees a marker when the header line itself is
+ * part of THIS diff's added lines, which is true the first time a generated
+ * file is added but false for every later regeneration where the header is
+ * unchanged and only the generated body below it changes — the normal case
+ * for a generator rerun. Reading the file directly catches an unchanged
+ * header regardless of what the diff touched. Returns false (never throws)
+ * if the file can't be read, or if no `repoRoot` was given (e.g. tests that
+ * exercise pure diff content with no real file on disk) — see
+ * DECISIONS.md's "Generated-file detection: unchanged-header case" entry.
+ */
+function isFileGeneratedOnDisk(file: DiffFile, repoRoot: string | undefined): boolean {
+  if (!repoRoot || file.status === "deleted") return false;
+  const lines = readFileHeaderLines(path.join(repoRoot, file.path));
+  if (!lines) return false;
+  return lines.some(markerLineMatches);
+}
+
+export function isFileGenerated(file: DiffFile, repoRoot?: string): boolean {
+  return isFileGeneratedFromDiff(file) || isFileGeneratedOnDisk(file, repoRoot);
 }
 
 // --- Formatting-only detection ------------------------------------------
@@ -285,7 +338,7 @@ export function evaluateCapturedDiff(diff: CapturedDiff, config: GraspConfig): F
       excludedFiles.push({ path: file.path, reason: ignoreReason });
       continue;
     }
-    if (isFileGenerated(file)) {
+    if (isFileGenerated(file, diff.repo)) {
       excludedFiles.push({ path: file.path, reason: "generated_file" });
       continue;
     }
