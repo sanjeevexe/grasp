@@ -24,8 +24,23 @@
 #      unattended edit/write/bash access for the whole run.
 #
 # Usage:
-#   MAX_ITERATIONS=10 ./auto_fix_test_loop.sh
+#   MAX_ITERATIONS=5 ./auto_fix_test_loop.sh
 #   CLAUDE_TIMEOUT_SECS=2700 CODEX_TIMEOUT_SECS=1800 ./auto_fix_test_loop.sh
+#
+# MAX_ITERATIONS means "how many rounds to run THIS invocation" -- it is not
+# a lifetime/absolute cap. Each run auto-detects the highest iteration number
+# already present in loop_logs/ and continues counting up from there, so
+# re-running this script after a previous run stopped (rate limit, timeout,
+# etc.) picks up correctly instead of overwriting the previous run's log
+# files of the same name. Nothing else needs to change between runs --
+# CODEX_TEST_REPORT.md and the git branch already carry the real state.
+#
+# NOTE on usage caps: Codex CLI (under a ChatGPT subscription) does not
+# expose a dollar figure or remaining-quota percentage to scripts, so the
+# only real lever for limiting usage on either tool is MAX_ITERATIONS --
+# set it conservatively if you're worried about your weekly limit. A
+# mid-run rate-limit stop (which the script already handles safely) is the
+# backstop either way.
 #
 set -uo pipefail
 
@@ -37,6 +52,13 @@ CLAUDE_TIMEOUT_SECS="${CLAUDE_TIMEOUT_SECS:-1800}"   # 30 min per fix round
 CODEX_TIMEOUT_SECS="${CODEX_TIMEOUT_SECS:-1800}"     # 30 min per test round
 LOG_DIR="$PROJECT_DIR/loop_logs"
 mkdir -p "$LOG_DIR"
+
+# Continue numbering from the last run instead of overwriting its logs.
+start_offset=0
+if compgen -G "$LOG_DIR"/iteration_*_fix_prompt.txt > /dev/null 2>&1; then
+  start_offset="$(ls "$LOG_DIR" | grep -oE '^iteration_[0-9]+_fix_prompt\.txt$' \
+    | grep -oE '[0-9]+' | sort -n | tail -1)"
+fi
 
 FIX_PROMPT_TEMPLATE="$PROJECT_DIR/prompts/fix_prompt_template.txt"
 TEST_PROMPT_TEMPLATE="$PROJECT_DIR/prompts/test_prompt_template.txt"
@@ -75,17 +97,23 @@ run_with_timeout() {
   return $exit_code
 }
 
-iteration=1
+iteration=$((start_offset + 1))
+end_iteration=$((start_offset + MAX_ITERATIONS))
 verdict="FAIL"
 
-echo "Starting Grasp auto-fix/test loop. Max iterations: $MAX_ITERATIONS"
+echo "Starting Grasp auto-fix/test loop."
+if [ "$start_offset" -gt 0 ]; then
+  echo "Resuming after iteration $start_offset -- this run covers iterations $iteration through $end_iteration."
+else
+  echo "This run covers iterations $iteration through $end_iteration."
+fi
 echo "Per-round timeouts: Claude ${CLAUDE_TIMEOUT_SECS}s, Codex ${CODEX_TIMEOUT_SECS}s"
 echo "Logs will be written to: $LOG_DIR"
 echo ""
 
-while [ "$iteration" -le "$MAX_ITERATIONS" ]; do
+while [ "$iteration" -le "$end_iteration" ]; do
   echo "=================================================="
-  echo "Iteration $iteration / $MAX_ITERATIONS -- Claude Code fixing"
+  echo "Iteration $iteration / $end_iteration -- Claude Code fixing"
   echo "=================================================="
 
   FIX_PROMPT="$(cat "$FIX_PROMPT_TEMPLATE")"
@@ -131,7 +159,7 @@ $(cat "$REPORT_FILE")"
   fi
 
   echo "=================================================="
-  echo "Iteration $iteration / $MAX_ITERATIONS -- Codex testing"
+  echo "Iteration $iteration / $end_iteration -- Codex testing"
   echo "=================================================="
 
   TEST_PROMPT="$(cat "$TEST_PROMPT_TEMPLATE")"
@@ -178,7 +206,7 @@ done
 
 echo ""
 if [ "$verdict" = "PASS" ]; then
-  notify "Grasp auto-loop finished" "All Codex checks passed after $iteration iteration(s). Ready for your manual testing pass."
+  notify "Grasp auto-loop finished" "All Codex checks passed as of iteration $iteration. Ready for your manual testing pass."
 else
-  notify "Grasp auto-loop stopped" "Hit the $MAX_ITERATIONS-iteration cap without a clean pass. Review loop_logs/ and CODEX_TEST_REPORT.md."
+  notify "Grasp auto-loop stopped" "Hit iteration $end_iteration (this run's cap) without a clean pass. Review loop_logs/ and CODEX_TEST_REPORT.md -- re-run to continue from here."
 fi
