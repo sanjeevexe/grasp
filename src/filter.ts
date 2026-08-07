@@ -182,12 +182,12 @@ function isFileGeneratedFromDiff(file: DiffFile): boolean {
 
       let lineNo = startLine;
       for (const line of h.lines) {
-        if (line.startsWith("-") && !line.startsWith("---")) {
+        if (line.startsWith("-")) {
           if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT && markerLineMatches(line.slice(1))) {
             return true;
           }
           lineNo++;
-        } else if (line.startsWith("+") && !line.startsWith("+++")) {
+        } else if (line.startsWith("+")) {
           // Added lines don't exist in the old file — they don't advance
           // the old-file line counter.
         } else {
@@ -206,12 +206,12 @@ function isFileGeneratedFromDiff(file: DiffFile): boolean {
 
     let lineNo = startLine;
     for (const line of h.lines) {
-      if (line.startsWith("+") && !line.startsWith("+++")) {
+      if (line.startsWith("+")) {
         if (lineNo <= GENERATED_FILE_HEADER_LINE_LIMIT && markerLineMatches(line.slice(1))) {
           return true;
         }
         lineNo++;
-      } else if (line.startsWith("-") && !line.startsWith("---")) {
+      } else if (line.startsWith("-")) {
         // Removed lines don't exist in the new file — they don't advance
         // the new-file line counter.
       } else {
@@ -288,16 +288,12 @@ function normalizeLine(line: string): string {
 
 /** A hunk's removed lines (with their `-` prefix stripped), normalized, in order. */
 function normalizedRemovedLines(hunk: DiffHunk): string[] {
-  return hunk.lines
-    .filter((l) => l.startsWith("-") && !l.startsWith("---"))
-    .map((l) => normalizeLine(l.slice(1)));
+  return hunk.lines.filter((l) => l.startsWith("-")).map((l) => normalizeLine(l.slice(1)));
 }
 
 /** A hunk's added lines (with their `+` prefix stripped), normalized, in order. */
 function normalizedAddedLines(hunk: DiffHunk): string[] {
-  return hunk.lines
-    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-    .map((l) => normalizeLine(l.slice(1)));
+  return hunk.lines.filter((l) => l.startsWith("+")).map((l) => normalizeLine(l.slice(1)));
 }
 
 function arraysEqual(a: string[], b: string[]): boolean {

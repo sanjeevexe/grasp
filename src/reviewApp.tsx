@@ -39,24 +39,45 @@ export interface ReviewAppProps {
   onSkip: (eventId: number, skipReason: string | null) => void;
 }
 
-interface RenderLine {
+export interface RenderLine {
   text: string;
   kind: "file" | "hunk" | "add" | "del" | "context";
 }
 
-function flattenDiffFiles(files: DiffFile[]): RenderLine[] {
+/**
+ * Hard-wraps `text` into chunks no longer than `width` characters. Used
+ * instead of relying on ink's own `<Text wrap="wrap">` so that each wrapped
+ * chunk becomes its own entry in the flattened `RenderLine[]` array — that
+ * keeps the up/down scroll pagination (which counts array entries, one per
+ * terminal row) accurate. See DECISIONS.md's "Review diff view: line
+ * wrapping instead of truncation" entry for why this replaced
+ * `wrap="truncate-end"`.
+ */
+export function wrapLine(text: string, width: number): string[] {
+  if (width <= 0 || text.length === 0) return [text];
+  if (text.length <= width) return [text];
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += width) {
+    chunks.push(text.slice(i, i + width));
+  }
+  return chunks;
+}
+
+export function flattenDiffFiles(files: DiffFile[], width: number): RenderLine[] {
   const lines: RenderLine[] = [];
+  const pushWrapped = (text: string, kind: RenderLine["kind"]) => {
+    for (const chunk of wrapLine(text.length > 0 ? text : " ", width)) {
+      lines.push({ text: chunk, kind });
+    }
+  };
   for (const file of files) {
     const label = file.oldPath ? `${file.oldPath} -> ${file.path}` : file.path;
-    lines.push({
-      text: `${file.status.toUpperCase()}  ${label}  (+${file.insertions}/-${file.deletions})`,
-      kind: "file",
-    });
+    pushWrapped(`${file.status.toUpperCase()}  ${label}  (+${file.insertions}/-${file.deletions})`, "file");
     for (const hunk of file.hunks) {
-      lines.push({ text: hunk.header, kind: "hunk" });
+      pushWrapped(hunk.header, "hunk");
       for (const l of hunk.lines) {
         const kind: RenderLine["kind"] = l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "context";
-        lines.push({ text: l.length > 0 ? l : " ", kind });
+        pushWrapped(l, kind);
       }
     }
   }
@@ -101,7 +122,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
       <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
         {hasMoreAbove ? <Text dimColor>↑ ({scrollOffset} more line{scrollOffset === 1 ? "" : "s"} above)</Text> : null}
         {visible.map((line, i) => (
-          <Text key={scrollOffset + i} color={LINE_COLOR[line.kind]} bold={line.kind === "file"} wrap="truncate-end">
+          <Text key={scrollOffset + i} color={LINE_COLOR[line.kind]} bold={line.kind === "file"}>
             {line.text}
           </Text>
         ))}
@@ -122,7 +143,14 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     onDone: (result: { type: "answered"; answers: ReviewAnswers } | { type: "skipped"; skipReason: string | null }) => void;
   }) {
     const { rows, columns } = useTerminalSize();
-    const lines = React.useMemo(() => flattenDiffFiles(event.diffFiles ?? []), [event]);
+    // DiffView's box spends 2 columns on its round border and 2 more on
+    // paddingX={1} (1 each side) — content narrower than that is what
+    // actually fits without ink's own wrapping kicking in a second time.
+    const diffContentWidth = Math.max(10, columns - 4);
+    const lines = React.useMemo(
+      () => flattenDiffFiles(event.diffFiles ?? [], diffContentWidth),
+      [event, diffContentWidth]
+    );
     const [scrollOffset, setScrollOffset] = useState(0);
 
     const hasConceptQuestion = Boolean(event.questionConcept);
@@ -140,6 +168,14 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     // the input/hint line, and the diff box's own border (2 rows).
     const reservedRows = 12;
     const maxDiffRows = Math.max(3, rows - reservedRows);
+
+    // A resize (or the width-dependent rewrap above changing how many
+    // wrapped rows exist) can leave a previously-valid scrollOffset past the
+    // new end of the list — clamp it back in range rather than showing a
+    // blank diff box.
+    useEffect(() => {
+      setScrollOffset((o) => Math.min(o, Math.max(0, lines.length - maxDiffRows)));
+    }, [lines, maxDiffRows]);
 
     useInput(
       (input, key) => {

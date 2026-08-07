@@ -122,10 +122,7 @@ function extractHunks(chunkOrDiffText: string): DiffHunk[] {
 }
 
 function countInsertions(hunks: DiffHunk[]): number {
-  return hunks.reduce(
-    (sum, h) => sum + h.lines.filter((l) => l.startsWith("+") && !l.startsWith("+++")).length,
-    0
-  );
+  return hunks.reduce((sum, h) => sum + h.lines.filter((l) => l.startsWith("+")).length, 0);
 }
 
 /**

@@ -121,6 +121,26 @@ test("isFileFormattingOnly: true for a formatter wrapping an assignment RHS in g
   assert.equal(isFileFormattingOnly(f), true);
 });
 
+test("isFileFormattingOnly: false when decrement statements become increment statements (regression: content lines starting with -- / ++ must not be mistaken for diff file headers)", () => {
+  // Regression test for a release-blocking bug an independent test pass
+  // reported: a diff line's own source content can legitimately start with
+  // "--" or "++" (e.g. `--a;` / `++a;`), which after the diff's own leading
+  // "-"/"+" marker becomes a line starting with the literal string "---" or
+  // "+++" — identical to how a *file header* line ("--- a/file" / "+++
+  // b/file") starts. The formatting-only check must not treat these hunk
+  // BODY lines as headers and silently drop both sides to two empty
+  // sequences (which would be vacuously "formatting-only").
+  const f = diffFile({
+    path: "a.js",
+    insertions: 3,
+    deletions: 3,
+    hunks: [
+      hunk("@@ -1,3 +1,3 @@", ["-  --a;", "-  --b;", "-  --c;", "+  ++a;", "+  ++b;", "+  ++c;"]),
+    ],
+  });
+  assert.equal(isFileFormattingOnly(f), false);
+});
+
 test("isFileFormattingOnly: false when grouping parentheses are added around a sub-expression, changing precedence", () => {
   // a && (b || c) is not equivalent to a && b || c — the parens here aren't
   // wrapping "everything after a safe boundary," they're wrapping only the
