@@ -2,124 +2,152 @@
 
 ## Summary
 
-Grasp builds and its normal, sequential workflow is substantially improved. The full automated suite passed (86 tests), and manual testing confirmed incremental diff capture, mechanical filtering, mock-Claude question generation, session-wide accumulation across turns, the interactive answer/skip flow, global concept memoization, both gate modes, and graceful error/timeout handling.
+Grasp builds, runs, and passes all 92 automated tests. Most of the main workflow also held up in independent manual testing: incremental diff capture, filtering, mock-Claude generation, cross-project concept memory, session-wide caps, the interactive answer/skip flow, both gate modes, repository-specific config, and ordinary error/timeout handling all worked.
 
-This run still found a release-blocking safety bug: the cost and question-count caps are not enforced atomically. Six overlapping generation workers all observed the session below its limit and all made a paid call. A one-question cap produced six question events, and a $0.001 cost cap allowed $0.006. This is reachable when distinct `PostToolUse` hooks overlap because capture is committed before the slow generation call begins.
+This run still found three real bugs.
 
-Two additional correctness bugs were reproduced. Unknown config keys are silently accepted, so a realistic typo such as `"gateMod": "hard"` leaves Grasp in soft mode without warning. Generated-file detection also treats any of the first five added diff lines containing phrases such as “do not edit” as proof that the whole file is generated, even when the addition is ordinary handwritten code deep in an existing file.
+First, generated-file detection can discard normal handwritten code. A five-line file whose third line was `throw new Error("Do not edit locked state")` was classified as generated solely because that phrase appeared within the first five lines. The documentation describes header markers from code generators, but the implementation also matches ordinary strings and executable statements.
 
-I would not rely on the caps as a spending/backlog safety rail in this build, so the final verdict is FAIL.
+Second, the fix that serializes overlapping generation calls can make a hook exceed its own 45-second limit. Three overlapping calls taking 16 seconds each completed at roughly 16, 32, and 48 seconds. Claude Code would kill the last hook at 45 seconds. Its diff has already been marked captured by then, so that question is lost with no retry.
+
+Third, a successful hook in a new Git repository with no commits prints `fatal: Needed a single revision` to stderr. Grasp correctly falls back to Git's empty tree and exits successfully, but Git's expected failure is leaked to the user as if something broke.
+
+I would hesitate to rely on Grasp for real work while meaningful handwritten changes can be filtered out and normal overlapping work can lose questions because of Grasp's own timeout design. The final verdict is FAIL.
 
 ### Test environment and isolation
 
-- Tested commit `05ca75a` on August 6, 2026, with Node `v26.5.1` and npm `11.17.0`.
-- All Grasp state, Git repositories, mock binaries, logs, npm cache data, and SQLite databases used for substantive testing lived under the disposable home `/private/tmp/grasp-codex-test.FyltpT`.
+- Tested commit `3fcacda` on August 6, 2026, with Node `v26.5.1` and npm `11.17.0`.
+- All Grasp state, mock executables, Git repositories, logs, npm cache data, and SQLite databases used for substantive testing lived under `/private/tmp/grasp-codex-test.Mb7Xsy`.
 - The developer's real `~/.grasp/history.db` was neither read nor modified.
-- The real Claude executable was present but reported `loggedIn: false` under the scratch home. The repository's established mock-`claude`-on-`PATH` pattern was used instead.
-- The scratch directory was removed after testing. The pre-existing modified `loop_logs/iteration_1_codex_output.jsonl` was left untouched.
+- The real `claude` executable was present but reported `loggedIn: false` under the disposable home. The repository's established mock-`claude`-on-`PATH` pattern was used.
+- The disposable test directory was removed after testing. The pre-existing modified `loop_logs/iteration_2_codex_output.jsonl` was left untouched.
 
 ## 1. Build, automated tests, packaging, and basic CLI — PASS
 
-`npm install` and `npm run build` succeeded. The built CLI printed version `0.1.0`, displayed help, created its config/database only in the scratch home, and ran successfully. `npm test` passed all 86 tests with no failures. `npm pack --dry-run --json` listed the expected executable, runtime modules, README, license, and package metadata.
+`npm install` and `npm run build` succeeded. The built CLI printed version `0.1.0`, displayed accurate help text, and ran using only the disposable home.
 
-`grasp init` clearly disclosed Claude usage and possible cost before writing, installed the required 45-second `PreToolUse`, `PostToolUse`, and `Stop` hooks, and was idempotent on a second run.
+`npm test` passed all 92 tests with no failures. This includes real multi-process regression tests for checkpoint claiming, SQLite writes, and concurrent cap enforcement. `npm pack --dry-run --json` listed the executable, runtime modules, README, license, and package metadata expected in the package.
+
+`grasp init`, run from a nested repository directory, clearly disclosed Claude usage and possible cost before writing. It installed 45-second `PreToolUse`, `PostToolUse`, and `Stop` hooks at the repository root. A second run was idempotent and did not duplicate them.
 
 ## 2. Diff capture and mechanical filtering — FAIL
 
 ### What worked
 
-- Manual capture included staged, unstaged, and untracked changes with correct paths, line counts, and hunks.
-- Hook capture used a pre-change checkpoint and captured only the three new lines added afterward; unrelated work that existed before the session was not attributed to the agent.
-- Repeating the same checkpoint transition did not duplicate capture. The automated eight-process same-transition regression test also passed.
-- Lockfiles, Grasp's own `.grasp.json` and `.claude/settings.local.json`, pure whitespace/reflow formatting, self-declared generated files, below/above size limits, and configured ignores were filtered in the expected cases.
-- A repository-specific `ignored/` rule excluded that directory without changing repository A's configuration.
-- Edited rename statistics, checkpoint rollback, checkpoint self-healing, and concurrent SQLite writes all passed their regression tests.
+- Manual capture included a staged change, an unstaged change, and an untracked file in one result, with the right paths, status, line counts, and hunks.
+- Hook capture used a pre-change checkpoint and captured only new work. A repeated `PostToolUse` firing with no further change produced no duplicate capture, event, or Claude call.
+- A normal 91-line file reached generation.
+- A lockfile, a formatting-only Markdown reflow, and a configured `ignored/` directory were filtered.
+- The same `ignored/` path in a different repository without that override reached generation, proving repository-specific ignore behavior.
+- The automated suite passed its rename-statistics, same-transition race, checkpoint rollback, and pruned-checkpoint recovery tests.
 
 ### What is broken
 
-Generated-file detection has a broad false positive. A normal hunk around line 100 whose first added line was `throw new Error("Do not edit locked state")` was classified as `generated_file`, and the whole meaningful change was discarded. The implementation checks the first five *added diff lines*, not whether the marker is actually a file-header declaration. Ordinary UI text, validation messages, or comments using “do not edit” can therefore suppress real questions.
+Generated-file recognition still has a broad false positive, just at the top of a file rather than deep in it. This ordinary five-line file was classified as `generated_file`:
+
+```js
+export function assertWritable(locked) {
+  if (locked) {
+    throw new Error("Do not edit locked state");
+  }
+}
+```
+
+The detector searches every added line in the first five file lines for phrases such as “do not edit”; it does not require a comment, a header shape, or a statement that actually declares the file generated. Ordinary validation messages, UI strings, and executable code near the top of a small file can therefore suppress a real question. The README's claim that Grasp recognizes self-declaring generated-file headers is too strong for this implementation.
 
 ## 3. Question generation and concept memoization — PASS (mocked)
 
-- The mock confirmed the exact promised invocation: one `claude -p` call, JSON output, empty allowed tools, and one maximum turn.
-- The prompt contained only the significant diff plus answered concept tags. Lockfiles and Grasp's own config files did not reach it.
-- A valid mock response produced a sensible concept-first pair; declines produced no pending question; malformed output, missing cost, invalid tags, and a new concept without its required concept question were rejected.
-- After `input-validation` was genuinely answered in repository A, a later repository B response using that tag was forced to instance-only even though the mock tried to return another concept question. Global memoization works.
-- Costs and diff hashes were recorded on successful and applicable failed responses.
+- The mock recorded the promised call shape: one `claude -p` invocation, JSON output, an empty allowed-tools value, and one maximum turn.
+- The prompt contained the significant diff and answered concept tags, but not the repository path or full-repository content.
+- A valid response produced a concept-first pair and recorded its reported cost and diff hash.
+- A model decline produced no pending question but still recorded the real call cost; the following `Stop` message showed cost without a false “question waiting” notice.
+- Process errors, malformed responses, missing cost, invalid concept tags, and a new concept missing its required concept question are covered by the passing automated suite.
+- After `input-validation` was answered in one repository, a second repository's response with the same tag was forced to instance-only even though the mock returned another concept question. The prompt also listed that tag as already answered.
 
-The real Claude CLI was not authenticated, so actual model question quality, stable concept tagging, and a live authenticated Claude Code hook firing could not be judged. This is an unverified integration limitation, not the reason for the FAIL verdict; the requested mock path worked.
+The real Claude CLI was not authenticated in the disposable home, so actual model question quality, stable real-world concept tagging, prompt-injection resistance, and a live authenticated Claude Code hook firing could not be judged. The requested mock path worked.
 
 ## 4. Cost cap and question-count cap — FAIL
 
-Sequential enforcement works across a whole Claude session rather than resetting per turn:
+Sequential enforcement works across an entire Claude session, not per turn:
 
-- With a $0.01 cap and two $0.006 calls on different `prompt_id` values, the third turn logged `cap_reached` without invoking Claude. Stored session cost was $0.012, matching the documented one-call crossing behavior.
-- With a one-event question cap, the first turn generated a question and the second turn logged `cap_reached` without invoking Claude.
-- The two limits remained independent in sequential tests.
+- With a $0.01 cost cap, two $0.006 calls on different turns were allowed and recorded ($0.012 total, matching the documented one-call crossing behavior); the third turn logged `cap_reached` without invoking Claude.
+- With a one-event question cap, the first turn generated a question and the second logged `cap_reached` without invoking Claude.
+- The automated six-process regressions passed: a one-question cap produced one real question plus five cap misses, and a $0.001 cap allowed only one $0.001 call.
 
-Parallel enforcement is broken. In two fresh databases, six processes called the real `runGeneration` code concurrently using a mock that took two seconds to respond:
+The integration with Claude Code's outer hook timeout is broken. Same-session generation calls are serialized, but each waiting hook still has a fixed 45-second lifetime. In an independent timing run, three concurrent workers using a 16-second mock finished at approximately 16, 32, and 48 seconds. All succeeded only because the test workers were not under Claude Code's installed 45-second hook timeout. In real use the last worker would be killed before recording a result.
 
-- With `questionsPerSessionCap: 1`, all six invoked Claude and all six stored real question events. No `cap_reached` row was written.
-- With `costCapUsd: 0.001` and each call costing $0.001, all six invoked Claude and the session reached $0.006. No `cap_reached` row was written.
-
-The cap checks and eventual event insert are separated by the slow external call, so every overlapping process can read the same old totals. The atomic checkpoint fix prevents several hooks from claiming the *same tree transition*, but it does not reserve cost/question capacity for separate transitions whose generation calls overlap. This breaks both advertised session safety limits.
+This is not merely a slow response. Capture and checkpoint advancement happen before generation starts, so the killed worker's diff will not be retried. Three parallel meaningful tool changes are enough to reproduce the timing mismatch, and 16 seconds is below Grasp's accepted 20-second per-call generation limit.
 
 ## 5. `grasp review` answer and skip flow — PASS
 
-The real Ink interface was exercised in a pseudo-terminal against a three-question, two-session batch.
+The real Ink interface was exercised in a pseudo-terminal.
 
-- It showed the repository, stored diff, colored change lines, concept then instance order, and accurate session/batch positions.
-- Doing nothing did not dismiss or skip anything.
-- Pressing Enter on a blank answer kept the same prompt open. A concurrent database check confirmed both answer columns remained null and the concept tag remained unanswered.
-- Real concept and instance answers were stored, and only then was the linked concept marked answered.
-- Escape deliberately entered the optional skip-reason step. Both a reasoned skip and a blank-reason skip were saved as skips without marking their concepts answered.
-- Non-interactive use failed clearly instead of hanging.
+- It rendered the stored repository, summary, colored diff, concept question, and instance question readably.
+- Doing nothing for two seconds did not advance or dismiss the question.
+- Entering answer mode and submitting a blank value kept the same question open. A real concept answer then advanced to the instance question.
+- Real concept and instance answers were stored in SQLite, and only then was the linked concept marked answered.
+- Escape deliberately opened the optional skip-reason step. Submitting a blank reason stored a real skip and did not mark the concept answered.
+- Running `grasp review` non-interactively failed clearly with exit code 1 instead of hanging.
 
-Terminal resizing could not be driven reliably through the unattended pseudo-terminal harness, so that one visual interaction remains unverified.
+Terminal resizing was not reliably controllable through the unattended pseudo-terminal harness, so resize behavior remains unverified.
 
 ## 6. Soft and hard gate modes — PASS
 
-- Soft mode produced no denial even with a pending question.
+- Soft mode did not deny a tool call while questions were pending.
 - Hard mode returned the documented `PreToolUse` denial JSON for a recent pending question in the same session.
-- Answering or skipping removed the denial immediately.
-- The same repository override worked when the hook payload's working directory was a nested `src/` directory, confirming repository-root resolution.
-- A `Stop` payload combined the correct pending count and four-decimal cumulative cost in one `systemMessage`.
-- Automated tests confirmed old questions do not hard-block and other sessions never block the current one.
+- Answering that question immediately removed the denial.
+- A repository-root hard-mode override worked when the hook payload's working directory was nested.
+- Recent questions from another session did not block.
+- Questions from the same session dated outside the 24-hour blocking window did not block, but `Stop` still reported them as pending.
+- A `Stop` message combined the correct pending count and four-decimal cumulative session cost.
 
-## 7. Failure, timeout, and interrupted-session handling — PASS
-
-- A mock process exiting nonzero produced an `error` miss, no pending question, and did not leak the mock's private stderr into the user's output.
-- A genuinely hanging mock was killed after about 20.01 seconds and logged `timeout` with unknown cost.
-- Malformed result JSON, Claude error envelopes, missing cost fields, and contract violations were handled as logged misses in the automated suite.
-- Invalid known config values roll the checkpoint transaction back instead of losing the edit; the regression test passed.
-- A pruned checkpoint object self-healed in the regression test instead of breaking all future captures.
-
-## 8. Configuration loading and per-repository overrides — FAIL
+## 7. Failure, timeout, and interrupted-session handling — FAIL
 
 ### What worked
 
-- The scratch global config was created with documented defaults.
-- Repository overrides changed cost, question count, gate mode, and ignore behavior from nested working directories.
-- Nested objects merged by key and arrays replaced rather than concatenated.
-- Invalid JSON and invalid values for every documented setting were rejected with clear errors.
-- Overrides stayed repository-specific.
+- A mock executable exiting nonzero produced an `error` miss, no pending question, no gate, and no raw child-process error in the user's output.
+- A genuinely slow mock was killed after about 20 seconds, logged a `timeout` miss with unknown cost, and did not create a phantom question or gate.
+- The passing automated suite covers invalid response envelopes, missing costs, bad config rollback, SQLite contention, and pruned checkpoint recovery.
 
 ### What is broken
 
-Unknown keys are not rejected. A repository config containing `"gateMod": "hard"` loaded successfully, retained that unused extra property, and left the real `gateMode` at `"soft"`. This is a likely hand-editing typo with a safety-relevant consequence: the user believes hard gating is enabled, but Grasp silently behaves as soft mode. The same problem applies to misspelled cap, threshold, and ignore keys.
+An expected Git probe leaks stderr in a new repository with no commits. A simulated `PreToolUse` completed successfully and created its turn/checkpoint state, but stderr contained:
+
+```text
+fatal: Needed a single revision
+```
+
+Grasp intentionally probes for `HEAD` and falls back to Git's empty-tree hash when it is absent. The fallback is correct, but the Git wrapper leaves child stderr inherited, so the expected probe failure is displayed like a real fault. This is especially likely on the first task in a brand-new repository.
+
+The serialized-generation timeout loss described in section 4 is also an interrupted-session failure created by Grasp itself, not an external crash.
+
+## 8. Configuration loading and per-repository overrides — PASS
+
+- The disposable global config was created with documented defaults.
+- Repository overrides changed gate mode, cost cap, question cap, and ignore behavior.
+- Overrides resolved from nested working directories to the repository root.
+- A custom ignore applied only to its own repository.
+- Nested objects merged by key and arrays replaced rather than concatenated in the automated tests.
+- Invalid JSON, invalid values, unknown top-level keys, and unknown nested threshold keys were rejected with clear errors.
+- A realistic typo, `"gateMod": "hard"`, exited nonzero and named the valid alternatives instead of silently leaving soft mode active.
 
 ## 9. Fresh-eyes code and documentation review — FAIL
 
-The source is generally readable, and the README is unusually direct about manual review, Claude usage, local storage, no answer grading, and the known single-call cost overshoot. Three material inconsistencies remain:
+The source is generally readable, and the README is unusually candid about local storage, Claude usage, on-demand review, answer grading, cost crossing, stale hard gates, checkpoint pruning, and the narrow process-kill window.
 
-1. The CLI help tagline says Grasp will “gate AI-coding-agent output behind comprehension questions.” The corrected architecture does not gate output: review is on demand, and optional hard mode denies the *next tool call*. The README explains this accurately, but the first line users see does not.
-2. The README describes the cost setting as stopping generation once the cap is hit and documents only one crossing call as possible overshoot. Under overlap, an arbitrary number of already-racing calls can start and charge before any result is recorded, as the six-call reproduction showed.
-3. The README says a shared `cap_reached` reason remains reconstructable from session totals and configured caps. Events do not store which cap fired or the cap values in force at that time. If configuration is later changed, historical rows are no longer reliably distinguishable using the current config.
+Three inconsistencies remain:
+
+1. The README says generated files are recognized by self-declaring header markers. The implementation matches marker phrases anywhere in any of the first five lines, including runtime strings and executable statements, as reproduced in section 2.
+2. The README describes the post-capture process-kill window as a narrow external interruption. With same-session calls queued behind the generation reservation, Grasp's own 45-second outer limit can deterministically create that failure after only three accepted 16-second calls.
+3. `TESTING_GUIDE.md` still says the shared `cap_reached` reason can be distinguished afterward by comparing session totals with configured caps. Unlike the corrected README, it does not explain that Grasp does not store the cap values that were active at the time; after a config change, the historical reason may not be reconstructable.
+
+A stale source comment in `src/init.ts` also says the inner generation timeout is “still unbuilt,” even though the 20-second timeout exists. This is not user-facing, but it makes the timeout relationship harder to maintain correctly.
 
 ## Additional bugs and risks found
 
-1. A crash after checkpoint capture commits but before `runGeneration` inserts an event can still lose that question permanently. Generation intentionally runs outside the capture transaction; normal Claude failures are caught, but a process kill or unexpected database exception in that gap leaves an unfiltered capture with no retry mechanism.
-2. Checkpoint Git trees are dangling objects. The implemented self-heal limits pruning damage to one lost transition, but that transition is silently unrecoverable and the README does not mention the tradeoff.
-3. The success criterion requiring a person to keep Grasp enabled during real work for a week remains unverified, as the README correctly acknowledges.
+1. The judge prompt inserts the diff directly and does not explicitly tell the model that instructions found inside the diff are untrusted data. A malicious or accidental code comment could try to make the judge decline the question or violate the response contract. This could not be tested against a real authenticated model in this run.
+2. Generation reservations have no ownership token. If a genuinely paused worker lives past the 45-second stale threshold, a second worker can steal the reservation; when the old worker resumes, its unconditional release deletes the newer worker's reservation. Normal calls should stay below 45 seconds, but machine sleep or process suspension makes this race possible.
+3. The documented narrow process-kill window and dangling Git checkpoint tradeoff remain real. Normal failures are logged, but a hard kill after capture can still lose one question.
+4. The original success criterion requiring a person to keep Grasp enabled during real work for a full week remains unverified, as the README acknowledges.
 
 FINAL_VERDICT: FAIL
