@@ -2,3 +2,4 @@ node_modules/
 dist/
 test-dist/
 *.log
+.codex-independent-test/
