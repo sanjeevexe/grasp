@@ -92,8 +92,9 @@ Below is a diff the agent produced. Decide, in this single response:
 1. Is this diff worth asking the developer a comprehension question about? Trivial, self-explanatory, or purely mechanical changes are not worth asking about.
 2. If worth asking about, pick ONE concept tag naming the general programming concept this diff exercises (e.g. "mutex-vs-channel", "recursion", "sql-injection", "async-await", "binary-search"). Use a short, reusable, kebab-case tag — the same underlying concept in a different file should get the same tag.
 3. Check the developer's already-answered concept tags below. If your chosen tag is already in that list, do NOT write a concept question — write the instance question only.
-4. If a concept question is warranted (tag not already answered), write one: it tests/teaches the general idea, independent of this specific codebase.
-5. Write an instance question that applies the concept directly to this diff. If a concept question was written, the instance question should be answerable BECAUSE of it. If no concept question was written (already known), the instance question should stand alone, referencing the diff directly.
+4. If a concept question is warranted (tag not already answered), write one: it tests/teaches the general idea, independent of this specific codebase. Also write a concise SAMPLE ANSWER for it — a correct, reasonably complete answer a knowledgeable developer might give, shown to the developer afterward for their own comparison.
+5. Write an instance question that applies the concept directly to this diff. If a concept question was written, the instance question should be answerable BECAUSE of it. If no concept question was written (already known), the instance question should stand alone, referencing the diff directly. Also write a concise SAMPLE ANSWER for the instance question, same purpose as above.
+6. Write a short, standalone explanation of the underlying concept — written so it makes sense on its own, without having seen the diff or either question first. This is shown to the developer only if they get stuck and want a hint before retrying, not a restatement of the question. Write exactly ONE explanation covering the concept, regardless of whether a concept question was included this time — it's the same underlying idea either way.
 
 Developer's already-answered concept tags (do not re-teach these): ${answeredList}
 
@@ -103,12 +104,14 @@ Diff:
 ${diffText}
 
 Respond with ONLY a single JSON object, no other text, no markdown code fence, matching exactly this shape:
-{"worthAsking": boolean, "conceptTag": string | null, "questionConcept": string | null, "questionInstance": string | null}
+{"worthAsking": boolean, "conceptTag": string | null, "questionConcept": string | null, "questionInstance": string | null, "sampleAnswerConcept": string | null, "sampleAnswerInstance": string | null, "conceptExplanation": string | null}
 
 Rules for the JSON:
-- If worthAsking is false: conceptTag, questionConcept, and questionInstance must all be null.
-- If worthAsking is true: conceptTag must be a non-empty kebab-case string, and questionInstance must be a non-empty string.
-- questionConcept must be null if conceptTag is in the already-answered list above; otherwise it must be a non-empty string.`;
+- If worthAsking is false: every other field must be null.
+- If worthAsking is true: conceptTag must be a non-empty kebab-case string, questionInstance must be a non-empty string, sampleAnswerInstance must be a non-empty string, and conceptExplanation must be a non-empty string.
+- questionConcept must be null if conceptTag is in the already-answered list above; otherwise it must be a non-empty string.
+- sampleAnswerConcept must be null exactly when questionConcept is null, and a non-empty string exactly when questionConcept is a non-empty string.
+- You are never shown the developer's own answer, and never will be — sampleAnswerConcept, sampleAnswerInstance, and conceptExplanation are reference material for the developer's own later self-comparison, not a grading or correctness check of anything.`;
 }
 
 // --- claude -p invocation and response parsing -----------------------------
@@ -247,6 +250,12 @@ export interface JudgeResponse {
   conceptTag: string | null;
   questionConcept: string | null;
   questionInstance: string | null;
+  /** Null exactly when questionConcept is null — enforced by parseJudgeResponse, not just documented. */
+  sampleAnswerConcept: string | null;
+  /** Always a non-empty string when worthAsking is true — questionInstance is never null in that branch. */
+  sampleAnswerInstance: string | null;
+  /** Always a non-empty string when worthAsking is true, for the same reason as sampleAnswerInstance. */
+  conceptExplanation: string | null;
 }
 
 /** Strips a ```json ... ``` / ``` ... ``` fence if the model wrapped its JSON in one despite instructions not to. */
@@ -269,7 +278,17 @@ function extractJsonBlock(text: string): string {
  */
 const KEBAB_CASE_TAG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-/** Returns null for anything that doesn't match the contract — malformed JSON, wrong types, or an internally inconsistent shape. Never throws. */
+/**
+ * Returns null for anything that doesn't match the contract — malformed
+ * JSON, wrong types, or an internally inconsistent shape. Never throws. A
+ * response with a real question but a missing/empty required sample answer
+ * or concept explanation is rejected here exactly like any other contract
+ * violation this function already enforced (kebab-case tag format,
+ * concept-first consistency) — see DECISIONS.md's "sample answers and
+ * concept explanation" entry for why these are hard-enforced rather than
+ * trusted from the model's own compliance, matching this function's
+ * existing posture for every other field.
+ */
 export function parseJudgeResponse(raw: string): JudgeResponse | null {
   let obj: any;
   try {
@@ -281,10 +300,25 @@ export function parseJudgeResponse(raw: string): JudgeResponse | null {
   if (typeof obj.worthAsking !== "boolean") return null;
 
   if (obj.worthAsking === false) {
-    if (obj.conceptTag !== null || obj.questionConcept !== null || obj.questionInstance !== null) {
+    if (
+      obj.conceptTag !== null ||
+      obj.questionConcept !== null ||
+      obj.questionInstance !== null ||
+      obj.sampleAnswerConcept !== null ||
+      obj.sampleAnswerInstance !== null ||
+      obj.conceptExplanation !== null
+    ) {
       return null;
     }
-    return { worthAsking: false, conceptTag: null, questionConcept: null, questionInstance: null };
+    return {
+      worthAsking: false,
+      conceptTag: null,
+      questionConcept: null,
+      questionInstance: null,
+      sampleAnswerConcept: null,
+      sampleAnswerInstance: null,
+      conceptExplanation: null,
+    };
   }
 
   if (typeof obj.conceptTag !== "string" || !KEBAB_CASE_TAG.test(obj.conceptTag.trim())) return null;
@@ -296,11 +330,29 @@ export function parseJudgeResponse(raw: string): JudgeResponse | null {
     return null;
   }
 
+  // sampleAnswerConcept must mirror questionConcept's own presence exactly —
+  // null together, non-empty string together. A concept question with no
+  // sample answer (or vice versa) is malformed, not a partial success.
+  if (obj.questionConcept === null) {
+    if (obj.sampleAnswerConcept !== null) return null;
+  } else if (typeof obj.sampleAnswerConcept !== "string" || obj.sampleAnswerConcept.trim().length === 0) {
+    return null;
+  }
+
+  // questionInstance is unconditionally non-null in this branch, so its
+  // sample answer and the shared concept explanation are unconditionally
+  // required too — there's always at least one question present here.
+  if (typeof obj.sampleAnswerInstance !== "string" || obj.sampleAnswerInstance.trim().length === 0) return null;
+  if (typeof obj.conceptExplanation !== "string" || obj.conceptExplanation.trim().length === 0) return null;
+
   return {
     worthAsking: true,
     conceptTag: obj.conceptTag.trim(),
     questionConcept: typeof obj.questionConcept === "string" ? obj.questionConcept.trim() : null,
     questionInstance: obj.questionInstance.trim(),
+    sampleAnswerConcept: typeof obj.sampleAnswerConcept === "string" ? obj.sampleAnswerConcept.trim() : null,
+    sampleAnswerInstance: obj.sampleAnswerInstance.trim(),
+    conceptExplanation: obj.conceptExplanation.trim(),
   };
 }
 
@@ -626,6 +678,14 @@ function runJudgeAndRecord(
       // model saw — no re-fetch from git, no re-running the Phase 4 filter
       // against a working tree that may have moved on since.
       diffFiles: significantFiles,
+      // Mirrors questionConcept's own inclusion gate above: if Grasp's own
+      // DB check overrides the model and drops the concept question, its
+      // sample answer must be dropped too (and per the contract enforced in
+      // parseJudgeResponse, parsed.sampleAnswerConcept is already null in
+      // that case regardless — this is defense in depth, not load-bearing).
+      sampleAnswerConcept: includeConceptQuestion ? parsed.sampleAnswerConcept : null,
+      sampleAnswerInstance: parsed.sampleAnswerInstance,
+      conceptExplanation: parsed.conceptExplanation,
     },
     [{ tag: parsed.conceptTag as string, answered: false }]
   );

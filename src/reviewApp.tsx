@@ -13,9 +13,18 @@ const { useState, useEffect, useCallback } = React;
  * works exactly like a normal import would from React's perspective.
  */
 
-export interface ReviewAnswers {
-  answerConcept: string | null;
-  answerInstance: string | null;
+/**
+ * The final disposition of one event's whole `grasp review` pass — both
+ * fields independently null-or-real, since the concept and instance phases
+ * can now each resolve on their own (see the "grasp review: explain-then-
+ * retry skip flow" DECISIONS.md entry). `instanceAnswer === null` is what
+ * makes the whole event a skip (instance is always the last phase); a real
+ * `conceptAnswer` can still be present even then, if the concept phase was
+ * separately answered for real before the instance phase was declined.
+ */
+export interface ReviewOutcome {
+  conceptAnswer: string | null;
+  instanceAnswer: string | null;
 }
 
 /**
@@ -35,8 +44,8 @@ export interface ReviewQueueItem {
 
 export interface ReviewAppProps {
   items: ReviewQueueItem[];
-  onAnswer: (eventId: number, answers: ReviewAnswers) => void;
-  onSkip: (eventId: number, skipReason: string | null) => void;
+  /** Called exactly once per event, when its `grasp review` pass concludes — see `ReviewOutcome`'s own comment for what each field means. */
+  onResolved: (eventId: number, outcome: ReviewOutcome) => void;
 }
 
 export interface RenderLine {
@@ -92,7 +101,25 @@ const LINE_COLOR: Record<RenderLine["kind"], string | undefined> = {
   context: undefined,
 };
 
-type Phase = "concept" | "instance" | "skip-reason";
+/**
+ * Six phases, not two-plus-a-generic-skip: "concept"/"instance" are the two
+ * answerable questions (unchanged in spirit from before), and each gets its
+ * own dedicated "-explain" (shows the shared concept explanation, offers one
+ * retry) and "-reveal" (shows that question's sample answer, reached after
+ * either a real answer OR a terminal decline) state, rather than a single
+ * generic "skip-reason"-style phase reused across both questions. See
+ * DECISIONS.md's "grasp review: explain-then-retry skip flow" entry for why
+ * per-question phase names were chosen over a shared generic name: the
+ * explanation/reveal content and the "which question does Escape return the
+ * user to" logic both genuinely differ by which question is active, and
+ * distinct names make that visible in the state itself rather than needing
+ * a separate "which question" side-variable to disambiguate a shared name.
+ */
+type Phase = "concept" | "concept-explain" | "concept-reveal" | "instance" | "instance-explain" | "instance-reveal";
+
+function isDisplayOnlyPhase(phase: Phase): boolean {
+  return phase === "concept-explain" || phase === "concept-reveal" || phase === "instance-explain" || phase === "instance-reveal";
+}
 
 export function createReviewApp({ ink, TextInput }: InkModules) {
   const { Box, Text, useInput, useApp } = ink;
@@ -139,7 +166,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     onDone,
   }: {
     event: EventRecord;
-    onDone: (result: { type: "answered"; answers: ReviewAnswers } | { type: "skipped"; skipReason: string | null }) => void;
+    onDone: (result: ReviewOutcome) => void;
   }) {
     const { rows, columns } = useTerminalSize();
     // DiffView's box spends 2 columns on its round border and 2 more on
@@ -154,8 +181,14 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
 
     const hasConceptQuestion = Boolean(event.questionConcept);
     const [phase, setPhase] = useState<Phase>(hasConceptQuestion ? "concept" : "instance");
-    const [conceptAnswer, setConceptAnswer] = useState("");
-    const [instanceAnswer, setInstanceAnswer] = useState("");
+    // Null until that phase concludes with a REAL answer (first attempt or
+    // retry) — stays null if the phase is ultimately declined, or never
+    // applicable (no concept question at all). This one nullable field is
+    // both "what gets recorded" AND "was this phase answered", so no
+    // separate outcome flag is needed — see resolveConceptPhase/
+    // resolveInstancePhase below.
+    const [conceptAnswer, setConceptAnswer] = useState<string | null>(null);
+    const [instanceAnswer, setInstanceAnswer] = useState<string | null>(null);
     const [inputValue, setInputValue] = useState("");
     // True only after a real Enter-while-blank submit attempt (not just
     // "the field happens to be empty right now") — see DECISIONS.md's
@@ -163,8 +196,26 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     // warning" entry for why this is tracked separately from "is the field
     // currently empty."
     const [blankSubmitAttempted, setBlankSubmitAttempted] = useState(false);
+    // Whether THIS phase has already used its one Escape -> explain -> retry
+    // cycle. First Escape (per phase) shows the explanation and offers a
+    // retry; a second Escape on the same phase is the terminal decline. See
+    // DECISIONS.md's "grasp review: explain-then-retry skip flow" entry.
+    const [conceptRetryOffered, setConceptRetryOffered] = useState(false);
+    const [instanceRetryOffered, setInstanceRetryOffered] = useState(false);
 
-    const questionText = phase === "concept" ? event.questionConcept : phase === "instance" ? event.questionInstance : null;
+    // Legacy fallback (point 5): a pre-migration event has no explanation
+    // text to show at all. When that's true, Escape behaves exactly like
+    // the old immediate-skip design — no explain screen, no retry offered —
+    // rather than showing a blank explanation. A missing sample answer is
+    // handled independently, per-phase, inside resolveConceptPhase/
+    // resolveInstancePhase below (skip straight to the next phase/finish
+    // instead of showing an empty reveal screen).
+    const hasExplanation = Boolean(event.conceptExplanation);
+
+    const questionText =
+      phase === "concept" || phase === "concept-explain" || phase === "concept-reveal"
+        ? event.questionConcept
+        : event.questionInstance;
 
     // Reserve rows for chrome around the diff box: repo/summary line, a
     // blank line, question label + text (up to 3 lines), a blank line,
@@ -180,21 +231,60 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
       setScrollOffset((o) => Math.min(o, Math.max(0, lines.length - maxDiffRows)));
     }, [lines, maxDiffRows]);
 
+    // Moves into the instance phase — the only phase concept ever advances
+    // to, since every real question always has an instance question (see
+    // EventRecord/questionType: "instance" | "both", never concept-alone).
+    const enterInstancePhase = useCallback(() => {
+      setPhase("instance");
+      setInputValue("");
+      setBlankSubmitAttempted(false);
+      setScrollOffset(0);
+    }, []);
+
+    // Concludes the concept phase, whether by a real answer or a decline.
+    // Shows that question's sample answer first if one exists (point 2/3);
+    // a legacy event with no sample answer skips straight to the instance
+    // phase instead of showing a broken/empty reveal screen (point 5).
+    const resolveConceptPhase = useCallback(
+      (answer: string | null) => {
+        setConceptAnswer(answer);
+        if (event.sampleAnswerConcept) {
+          setPhase("concept-reveal");
+          setScrollOffset(0);
+        } else {
+          enterInstancePhase();
+        }
+      },
+      [event.sampleAnswerConcept, enterInstancePhase]
+    );
+
+    // Concludes the instance phase (always the last phase) — finishes the
+    // whole event, via a reveal screen first if a sample answer exists.
+    const resolveInstancePhase = useCallback(
+      (answer: string | null) => {
+        setInstanceAnswer(answer);
+        if (event.sampleAnswerInstance) {
+          setPhase("instance-reveal");
+          setScrollOffset(0);
+        } else {
+          onDone({ conceptAnswer, instanceAnswer: answer });
+        }
+      },
+      [event.sampleAnswerInstance, conceptAnswer, onDone]
+    );
+
     // Always active — the answer field (TextInput, below) is focused from
-    // the moment the question renders, with no separate "viewing" mode to
-    // switch out of first (see DECISIONS.md's entry for why that mode was
+    // the moment a question renders, with no separate "viewing" mode to
+    // switch out of first (see DECISIONS.md's "immediate focus, working
+    // scroll, no premature blank warning" entry for why that mode was
     // removed: it was the direct cause of a real "have to press Enter once
-    // before typing does anything" bug). Up/down arrow scrolls the diff
-    // concurrently with typing — safe because ink-text-input's own input
-    // handling explicitly ignores up/down arrows (confirmed by reading
-    // node_modules/ink-text-input/build/index.js, not assumed), so both
-    // this handler and TextInput's can be active on the same keypress
-    // without conflict, the same way Escape already worked below. Note
-    // this means 'j'/'k' are no longer scroll shortcuts — the old
-    // viewing-only mode could safely treat single letters as hotkeys since
-    // no text field was ever active then, but a global handler can't
-    // consume ordinary letters without breaking anyone whose answer uses
-    // them.
+    // before typing does anything" bug). The explain/reveal screens added
+    // here are new RENDER STATES of this same always-active handler, not a
+    // new mode gate on the answer field itself — TextInput is still
+    // unconditionally live the instant a "concept"/"instance" phase
+    // renders, exactly as before; see DECISIONS.md's "grasp review:
+    // explain-then-retry skip flow" entry for why this distinction matters
+    // and doesn't reintroduce the bug that fix addressed.
     //
     // Wrapped in useCallback: ink's own `useInput` re-subscribes its stdin
     // listener whenever the handler function reference changes (confirmed
@@ -203,16 +293,81 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     // arrow function here would get a new reference on every keystroke's
     // resulting re-render, tearing down and re-adding the listener each
     // time — which is exactly what was silently dropping most rapid
-    // scroll keypresses before this fix (reproduced empirically: 5 down-
-    // arrow presses 150ms apart registered only 2 scroll steps).
+    // scroll keypresses before the prior fix (reproduced empirically: 5
+    // down-arrow presses 150ms apart registered only 2 scroll steps).
     const handleGlobalInput = useCallback(
       (_input: string, key: { escape: boolean; upArrow: boolean; downArrow: boolean }) => {
-        if (key.escape) {
-          if (phase !== "skip-reason") {
-            setPhase("skip-reason");
+        if (isDisplayOnlyPhase(phase)) {
+          // Arrow keys still scroll the diff on explain/reveal screens —
+          // deliberately NOT treated as "continue" — so a user can scroll
+          // back up to re-read the diff while reading an explanation or
+          // sample answer, matching how scrolling already works during the
+          // answering phases. See DECISIONS.md's "grasp review: explain-
+          // then-retry skip flow" entry for why this was chosen over
+          // treating literally every key (including arrows) as "continue."
+          if (key.downArrow) {
+            setScrollOffset((o) => Math.min(o + 1, Math.max(0, lines.length - maxDiffRows)));
+            return;
+          }
+          if (key.upArrow) {
+            setScrollOffset((o) => Math.max(0, o - 1));
+            return;
+          }
+          // Any other key — including Enter and Escape — continues past a
+          // "press any key to continue" screen.
+          if (phase === "concept-explain") {
+            setPhase("concept");
             setInputValue("");
             setBlankSubmitAttempted(false);
+            return;
           }
+          if (phase === "instance-explain") {
+            setPhase("instance");
+            setInputValue("");
+            setBlankSubmitAttempted(false);
+            return;
+          }
+          if (phase === "concept-reveal") {
+            enterInstancePhase();
+            return;
+          }
+          // phase === "instance-reveal"
+          onDone({ conceptAnswer, instanceAnswer });
+          return;
+        }
+
+        // phase is "concept" or "instance" (answering).
+        if (key.escape) {
+          if (phase === "concept") {
+            if (!hasExplanation) {
+              // Legacy fallback: no explanation to show, so Escape behaves
+              // exactly like the old immediate-skip design — no retry ever
+              // offered for this event.
+              resolveConceptPhase(null);
+              return;
+            }
+            if (!conceptRetryOffered) {
+              setConceptRetryOffered(true);
+              setPhase("concept-explain");
+              setScrollOffset(0);
+              return;
+            }
+            // Already retried once and declined again — terminal decline.
+            resolveConceptPhase(null);
+            return;
+          }
+          // phase === "instance"
+          if (!hasExplanation) {
+            resolveInstancePhase(null);
+            return;
+          }
+          if (!instanceRetryOffered) {
+            setInstanceRetryOffered(true);
+            setPhase("instance-explain");
+            setScrollOffset(0);
+            return;
+          }
+          resolveInstancePhase(null);
           return;
         }
         if (key.downArrow) {
@@ -224,7 +379,20 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
           return;
         }
       },
-      [phase, lines.length, maxDiffRows]
+      [
+        phase,
+        lines.length,
+        maxDiffRows,
+        hasExplanation,
+        conceptRetryOffered,
+        instanceRetryOffered,
+        conceptAnswer,
+        instanceAnswer,
+        onDone,
+        enterInstancePhase,
+        resolveConceptPhase,
+        resolveInstancePhase,
+      ]
     );
     useInput(handleGlobalInput);
 
@@ -240,43 +408,25 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
         // A blank/whitespace-only submission is never a real answer — see
         // DECISIONS.md's "Blank-answer rejection" entry. Pressing Enter on
         // empty input simply does nothing (stays put, no state change) —
-        // the skip-reason prompt is the one phase where blank IS a
-        // legitimate submission (the reason itself is optional per brief
-        // §3.1 — only the concept/instance ANSWER text must be real, not
-        // the skip explanation).
-        if (phase !== "skip-reason" && value.trim().length === 0) {
+        // same behavior whether this is a first attempt or the one retry
+        // attempt after an explanation.
+        if (value.trim().length === 0) {
           setBlankSubmitAttempted(true);
           return;
         }
         if (phase === "concept") {
-          setConceptAnswer(value);
-          if (hasConceptQuestion && event.questionInstance) {
-            setPhase("instance");
-            setInputValue(instanceAnswer);
-            setBlankSubmitAttempted(false);
-            setScrollOffset(0);
-          } else {
-            onDone({ type: "answered", answers: { answerConcept: value, answerInstance: null } });
-          }
+          resolveConceptPhase(value);
           return;
         }
-        if (phase === "instance") {
-          onDone({
-            type: "answered",
-            answers: {
-              answerConcept: hasConceptQuestion ? conceptAnswer : null,
-              answerInstance: value,
-            },
-          });
-          return;
-        }
-        // phase === "skip-reason"
-        onDone({ type: "skipped", skipReason: value.trim().length > 0 ? value.trim() : null });
+        // phase === "instance"
+        resolveInstancePhase(value);
       },
-      [phase, hasConceptQuestion, conceptAnswer, instanceAnswer, event.questionInstance, onDone]
+      [phase, resolveConceptPhase, resolveInstancePhase]
     );
 
-    const showBlankWarning = phase !== "skip-reason" && blankSubmitAttempted && inputValue.trim().length === 0;
+    const isAnsweringPhase = phase === "concept" || phase === "instance";
+    const showBlankWarning = isAnsweringPhase && blankSubmitAttempted && inputValue.trim().length === 0;
+    const escHint = hasExplanation ? "[Esc] stuck? see explanation" : "[Esc] skip";
 
     return (
       <Box flexDirection="column">
@@ -286,36 +436,58 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
           <DiffView lines={lines} scrollOffset={scrollOffset} maxRows={maxDiffRows} />
         </Box>
         <Box marginTop={1} flexDirection="column">
-          {phase === "skip-reason" ? (
+          <Text bold>
+            {phase === "concept" || phase === "concept-explain" || phase === "concept-reveal" ? "Concept question:" : "Instance question:"} {questionText}
+          </Text>
+        </Box>
+        {phase === "concept-explain" || phase === "instance-explain" ? (
+          <Box marginTop={1} flexDirection="column">
             <Text bold color="yellow">
-              Why are you skipping? (optional)
+              Stuck? Here's the idea behind this question:
             </Text>
-          ) : (
-            <Text bold>
-              {phase === "concept" ? "Concept question:" : "Instance question:"} {questionText}
+            <Text>{event.conceptExplanation}</Text>
+            <Box marginTop={1}>
+              <Text dimColor>
+                Press any key to try again — you get one more shot at this question.   (terminal: {columns}x{rows})
+              </Text>
+            </Box>
+          </Box>
+        ) : phase === "concept-reveal" || phase === "instance-reveal" ? (
+          <Box marginTop={1} flexDirection="column">
+            <Text bold color="green">
+              {(phase === "concept-reveal" ? conceptAnswer : instanceAnswer) !== null
+                ? "Your answer was recorded. Sample answer, for comparison:"
+                : "Sample answer:"}
             </Text>
-          )}
-        </Box>
-        <Box marginTop={1} flexDirection="column">
-          <TextInput
-            value={inputValue}
-            onChange={handleInputChange}
-            onSubmit={submitCurrentPhase}
-            placeholder={phase === "skip-reason" ? "press Enter to leave blank" : "type your answer, Enter to submit"}
-          />
-          {showBlankWarning ? (
-            <Text color="yellow">A blank answer isn't accepted — type something, or press Esc to skip instead.</Text>
-          ) : phase === "skip-reason" ? (
-            <Text dimColor>[Enter] submit (blank = no reason given)   (terminal: {columns}x{rows})</Text>
-          ) : (
-            <Text dimColor>[Enter] submit   [↑/↓] scroll diff   [Esc] skip   (terminal: {columns}x{rows})</Text>
-          )}
-        </Box>
+            <Text>{phase === "concept-reveal" ? event.sampleAnswerConcept : event.sampleAnswerInstance}</Text>
+            <Box marginTop={1}>
+              <Text dimColor>Press any key to continue.   (terminal: {columns}x{rows})</Text>
+            </Box>
+          </Box>
+        ) : (
+          <Box marginTop={1} flexDirection="column">
+            <TextInput
+              value={inputValue}
+              onChange={handleInputChange}
+              onSubmit={submitCurrentPhase}
+              placeholder="type your answer, Enter to submit"
+            />
+            {showBlankWarning ? (
+              <Text color="yellow">
+                A blank answer isn't accepted — type something, or press Esc {hasExplanation ? "for help" : "to skip"} instead.
+              </Text>
+            ) : (
+              <Text dimColor>
+                [Enter] submit   [↑/↓] scroll diff   {escHint}   (terminal: {columns}x{rows})
+              </Text>
+            )}
+          </Box>
+        )}
       </Box>
     );
   }
 
-  function App({ items, onAnswer, onSkip }: ReviewAppProps) {
+  function App({ items, onResolved }: ReviewAppProps) {
     const { exit } = useApp();
     const [index, setIndex] = useState(0);
 
@@ -324,22 +496,15 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     }, [items.length, exit]);
 
     const handleDone = useCallback(
-      (
-        event: EventRecord,
-        result: { type: "answered"; answers: ReviewAnswers } | { type: "skipped"; skipReason: string | null }
-      ) => {
-        if (result.type === "answered") {
-          onAnswer(event.id as number, result.answers);
-        } else {
-          onSkip(event.id as number, result.skipReason);
-        }
+      (event: EventRecord, result: ReviewOutcome) => {
+        onResolved(event.id as number, result);
         setIndex((i) => {
           const next = i + 1;
           if (next >= items.length) exit();
           return next;
         });
       },
-      [items.length, exit, onAnswer, onSkip]
+      [items.length, exit, onResolved]
     );
 
     if (index >= items.length) {

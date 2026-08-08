@@ -2,7 +2,7 @@ import * as React from "react";
 import { loadInk } from "./inkLoader";
 import { createReviewApp, ReviewQueueItem } from "./reviewApp";
 import { EventRecord } from "./types";
-import { getPendingQuestions, markEventAnswered, markEventSkipped, openStore } from "./store";
+import { getPendingQuestions, markConceptAnswered, markEventSkipped, markInstanceAnswered, openStore } from "./store";
 
 /**
  * Groups pending events into batches by `session_id` — same session's
@@ -78,11 +78,21 @@ export async function runReview(): Promise<void> {
   const instance = ink.render(
     React.createElement(App, {
       items,
-      onAnswer: (eventId: number, answers: { answerConcept: string | null; answerInstance: string | null }) => {
-        markEventAnswered(db, eventId, answers);
-      },
-      onSkip: (eventId: number, skipReason: string | null) => {
-        markEventSkipped(db, eventId, skipReason);
+      // The concept and instance phases each resolve independently now
+      // (see reviewApp.tsx's "grasp review: explain-then-retry skip flow"
+      // comment) — a real concept answer is persisted as soon as it's
+      // known, regardless of what the instance phase goes on to do.
+      // instanceAnswer === null is what makes the whole event a skip,
+      // since the instance phase is always the last one.
+      onResolved: (eventId: number, outcome: { conceptAnswer: string | null; instanceAnswer: string | null }) => {
+        if (outcome.conceptAnswer !== null) {
+          markConceptAnswered(db, eventId, outcome.conceptAnswer);
+        }
+        if (outcome.instanceAnswer !== null) {
+          markInstanceAnswered(db, eventId, outcome.instanceAnswer);
+        } else {
+          markEventSkipped(db, eventId);
+        }
       },
     })
   );

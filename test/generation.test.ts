@@ -22,6 +22,9 @@ test("parseJudgeResponse: a well-formed worthAsking=true, both-questions respons
     conceptTag: "mutex-vs-channel",
     questionConcept: "What is a mutex?",
     questionInstance: "Why did this diff use one?",
+    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
+    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
   });
   const parsed = parseJudgeResponse(raw);
   assert.deepEqual(parsed, {
@@ -29,6 +32,9 @@ test("parseJudgeResponse: a well-formed worthAsking=true, both-questions respons
     conceptTag: "mutex-vs-channel",
     questionConcept: "What is a mutex?",
     questionInstance: "Why did this diff use one?",
+    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
+    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
   });
 });
 
@@ -38,24 +44,50 @@ test("parseJudgeResponse: worthAsking=true with a null questionConcept (already-
     conceptTag: "mutex-vs-channel",
     questionConcept: null,
     questionInstance: "Why did this diff use one?",
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
+    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
   });
   const parsed = parseJudgeResponse(raw);
   assert.equal(parsed?.questionConcept, null);
   assert.equal(parsed?.questionInstance, "Why did this diff use one?");
+  assert.equal(parsed?.sampleAnswerConcept, null);
 });
 
 test("parseJudgeResponse: a well-formed worthAsking=false response parses", () => {
-  const raw = JSON.stringify({ worthAsking: false, conceptTag: null, questionConcept: null, questionInstance: null });
+  const raw = JSON.stringify({
+    worthAsking: false,
+    conceptTag: null,
+    questionConcept: null,
+    questionInstance: null,
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: null,
+    conceptExplanation: null,
+  });
   assert.deepEqual(parseJudgeResponse(raw), {
     worthAsking: false,
     conceptTag: null,
     questionConcept: null,
     questionInstance: null,
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: null,
+    conceptExplanation: null,
   });
 });
 
 test("parseJudgeResponse: strips a markdown code fence the model wasn't supposed to add", () => {
-  const raw = "```json\n" + JSON.stringify({ worthAsking: false, conceptTag: null, questionConcept: null, questionInstance: null }) + "\n```";
+  const raw =
+    "```json\n" +
+    JSON.stringify({
+      worthAsking: false,
+      conceptTag: null,
+      questionConcept: null,
+      questionInstance: null,
+      sampleAnswerConcept: null,
+      sampleAnswerInstance: null,
+      conceptExplanation: null,
+    }) +
+    "\n```";
   const parsed = parseJudgeResponse(raw);
   assert.equal(parsed?.worthAsking, false);
 });
@@ -108,8 +140,115 @@ test("parseJudgeResponse: accepts a multi-word kebab-case conceptTag", () => {
     conceptTag: "mutex-vs-channel-2",
     questionConcept: "x",
     questionInstance: "y",
+    sampleAnswerConcept: "sample x",
+    sampleAnswerInstance: "sample y",
+    conceptExplanation: "explanation",
   });
   assert.equal(parseJudgeResponse(raw)?.conceptTag, "mutex-vs-channel-2");
+});
+
+// --- parseJudgeResponse: sample answers + concept explanation contract ----
+//
+// Same enforcement posture as every other field this parser checks (kebab-
+// case tag, concept-first consistency): a response with a real question but
+// a missing/empty required sample answer or explanation is rejected as
+// malformed, never silently accepted with a null/missing field. See
+// DECISIONS.md's "sample answers and concept explanation" entry.
+
+test("parseJudgeResponse: rejects a concept question with no sample answer for it", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: "concept question",
+    questionInstance: "instance question",
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: "sample instance answer",
+    conceptExplanation: "explanation",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: rejects a concept question with a blank (whitespace-only) sample answer", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: "concept question",
+    questionInstance: "instance question",
+    sampleAnswerConcept: "   ",
+    sampleAnswerInstance: "sample instance answer",
+    conceptExplanation: "explanation",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: rejects a sampleAnswerConcept present when questionConcept is null (already-known concept)", () => {
+  // The inverse of the missing-sample-answer case: a sample answer for a
+  // question that wasn't even asked is just as inconsistent as the reverse.
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: null,
+    questionInstance: "instance question",
+    sampleAnswerConcept: "should not be here",
+    sampleAnswerInstance: "sample instance answer",
+    conceptExplanation: "explanation",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: rejects a missing sample answer for the instance question", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: null,
+    questionInstance: "instance question",
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: "",
+    conceptExplanation: "explanation",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: rejects a missing concept explanation even when both questions are otherwise well-formed", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: "concept question",
+    questionInstance: "instance question",
+    sampleAnswerConcept: "sample concept answer",
+    sampleAnswerInstance: "sample instance answer",
+    conceptExplanation: null,
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: rejects a missing concept explanation on an instance-only response (concept already known)", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "tag",
+    questionConcept: null,
+    questionInstance: "instance question",
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: "sample instance answer",
+    conceptExplanation: "   ",
+  });
+  assert.equal(parseJudgeResponse(raw), null);
+});
+
+test("parseJudgeResponse: a fully well-formed response with both questions, both sample answers, and an explanation parses", () => {
+  const raw = JSON.stringify({
+    worthAsking: true,
+    conceptTag: "mutex-vs-channel",
+    questionConcept: "What is a mutex?",
+    questionInstance: "Why did this diff use one?",
+    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
+    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
+  });
+  const parsed = parseJudgeResponse(raw);
+  assert.equal(parsed?.sampleAnswerConcept, "A mutex is a mutual-exclusion lock.");
+  assert.equal(parsed?.sampleAnswerInstance, "Because only one goroutine may touch the cache at a time.");
+  assert.equal(parsed?.conceptExplanation, "A mutex protects a shared resource so only one thread accesses it at once.");
 });
 
 // --- runGeneration: concept-first enforcement -----------------------------
@@ -229,6 +368,29 @@ test("runGeneration: the SAME response shape is accepted once the concept is alr
 
   assert.equal(outcome!.missReason, null);
   assert.equal(outcome!.questionType, "instance");
+  db.close();
+});
+
+// --- runGeneration: sample answers + explanation land on the stored event -
+
+test("runGeneration: a well-formed response's sample answers and concept explanation are all stored on the event", () => {
+  const db = openStore(tempDbPath());
+  const params = baseParams();
+  let outcome: ReturnType<typeof runGeneration> | undefined;
+
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
+    outcome = runGeneration(db, params);
+  });
+
+  assert.equal(outcome!.missReason, null);
+  assert.equal(outcome!.questionType, "both");
+
+  const row = db
+    .prepare("SELECT sample_answer_concept, sample_answer_instance, concept_explanation FROM events WHERE id = ?")
+    .get(outcome!.eventId) as any;
+  assert.equal(row.sample_answer_concept, "sample answer for concept 0");
+  assert.equal(row.sample_answer_instance, "sample answer for instance 0");
+  assert.equal(row.concept_explanation, "explanation for concept 0");
   db.close();
 });
 

@@ -57,6 +57,39 @@ export interface EventRecord {
    * rows — there's no question to render for either.
    */
   diffFiles: DiffFile[] | null;
+  /**
+   * A concise reference answer for `questionConcept`, generated in the same
+   * judge call — shown to the user in `grasp review` AFTER they've already
+   * submitted their own answer (or genuinely declined), for self-comparison
+   * only. Never used to grade, score, or judge the user's own answer — see
+   * DECISIONS.md's "sample answers and concept explanation" entry and the
+   * brief §4 deferred-table guardrail on answer grading. Null exactly when
+   * `questionConcept` is null (no concept question, nothing to sample), and
+   * always null on pre-migration ("legacy") rows. Optional so existing call
+   * sites (miss rows, `debug:seed`, older tests) that never set it don't
+   * need updating — same pattern as `costUnknown`.
+   */
+  sampleAnswerConcept?: string | null;
+  /**
+   * Same as `sampleAnswerConcept`, for `questionInstance`. `questionInstance`
+   * is always present on a real question event, so this is only null on a
+   * miss/declined row (no question at all) or a pre-migration legacy row.
+   */
+  sampleAnswerInstance?: string | null;
+  /**
+   * A short, standalone explanation of the underlying concept — written to
+   * make sense on its own, without having seen the diff or either question
+   * first. Shown in `grasp review` if the user presses Escape on a question
+   * they're stuck on, before giving them one retry at it (see DECISIONS.md's
+   * "grasp review: explain-then-retry skip flow" entry). One explanation per
+   * event, reused for both the concept and instance phase's Escape — not
+   * regenerated per phase, since it's explaining the same underlying idea
+   * either way. Null exactly when there's no question at all (miss/declined
+   * row), or on a pre-migration legacy row — `grasp review` falls back to an
+   * immediate, no-retry skip in that case rather than showing a blank
+   * explanation screen.
+   */
+  conceptExplanation?: string | null;
 }
 
 export interface ConceptTagRecord {

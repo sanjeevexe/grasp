@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { spawn } from "child_process";
-import { openStore, insertEvent, getEventById } from "../src/store";
+import { openStore, insertEvent, getEventById, getConceptTagsByEventId } from "../src/store";
 
 /**
  * Real-pseudo-terminal regression tests for a dogfooding bug report found
@@ -64,8 +64,24 @@ function runPty(
   });
 }
 
-/** A `.grasp/history.db` under a fresh scratch $HOME, seeded with one pending both-type question — same DAL calls `debug:seed` uses, not a stub. */
-function seedHome(diffFiles: Parameters<typeof insertEvent>[1]["diffFiles"]): { home: string; dbPath: string; eventId: number } {
+interface SeedExtras {
+  sampleAnswerConcept?: string | null;
+  sampleAnswerInstance?: string | null;
+  conceptExplanation?: string | null;
+}
+
+/**
+ * A `.grasp/history.db` under a fresh scratch $HOME, seeded with one pending
+ * both-type question — same DAL calls `debug:seed` uses, not a stub. `extras`
+ * left at its default (all three fields omitted/undefined) reproduces a
+ * pre-migration "legacy" event exactly — `insertEvent`/`toEventRow` default
+ * an omitted optional field to NULL, the real behavior a genuinely older row
+ * would have, not a stand-in for it.
+ */
+function seedHome(
+  diffFiles: Parameters<typeof insertEvent>[1]["diffFiles"],
+  extras: SeedExtras = {}
+): { home: string; dbPath: string; eventId: number } {
   const home = mkTempDir("grasp-test-pty-home-");
   const dbPath = path.join(home, ".grasp", "history.db");
   // openStore(dbPath) only ever mkdir's the DEFAULT GRASP_HOME (~/.grasp),
@@ -92,6 +108,9 @@ function seedHome(diffFiles: Parameters<typeof insertEvent>[1]["diffFiles"]): { 
       skipReason: null,
       costUsd: 0.001,
       diffFiles,
+      sampleAnswerConcept: extras.sampleAnswerConcept,
+      sampleAnswerInstance: extras.sampleAnswerInstance,
+      conceptExplanation: extras.conceptExplanation,
     },
     [{ tag: "mutex-vs-channel", answered: false }]
   );
@@ -267,3 +286,209 @@ test("grasp review: blank Enter is still rejected (warning shown), and typing af
   assert.equal(row?.answerConcept, "real answer now");
   assert.equal(row?.answerInstance, "real instance answer");
 });
+
+/**
+ * Regression tests for this session's third round of dogfooding-driven
+ * work: sample answers + a concept explanation, shown to the user for
+ * self-comparison after a real answer (never a comparison or judgment of
+ * what they typed — see the guardrail in DECISIONS.md's "sample answers and
+ * concept explanation" entry), and an explain-then-retry flow replacing the
+ * old "why are you skipping?" free-text prompt on Escape.
+ *
+ * A repeated string (the shared explain-screen heading/footer, or the one
+ * `conceptExplanation` text reused across both phases per design) can't
+ * reliably discriminate a SECOND occurrence via `wait_for` — the pty
+ * driver's buffer accumulates for the whole run and never resets, so a
+ * `wait_for` on text already seen once passes immediately without actually
+ * waiting for the second occurrence. Where a step needs to pace past one of
+ * these repeated strings, a plain `sleep` is used instead (0.3-0.4s,
+ * matching this file's own established pacing for simple, non-coalescing-
+ * prone single control bytes — Escape/Enter are each one byte, unlike the
+ * earlier multi-byte-arrow-after-bulk-text case that needed `wait_for`-based
+ * synchronization to avoid OS-level coalescing). Wherever the text IS
+ * unique in a given run (a sample answer's own content, "Instance
+ * question:", which only appears once per run), `wait_for` is still used.
+ */
+
+test(
+  "grasp review: a real concept answer shows its own sample answer before advancing to the instance phase",
+  { timeout: 20_000 },
+  async () => {
+    const { home, dbPath, eventId } = seedHome(shortDiff(), {
+      sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+      sampleAnswerInstance: "Because only one goroutine may touch cache at a time.",
+      conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
+    });
+
+    const result = await runPty(
+      [
+        { type: "wait_for", text: "Concept question:", timeout: 8 },
+        { type: "send", text: "the answer is a mutex" },
+        { type: "sleep", seconds: 0.3 },
+        { type: "send", text: "\r" },
+        // Sample answer shown BEFORE advancing — not the instance question yet.
+        { type: "wait_for", text: "A mutex is a mutual-exclusion lock.", timeout: 3 },
+        { type: "send", text: "\r" },
+        { type: "wait_for", text: "Instance question:", timeout: 5 },
+        { type: "send", text: "because it needs mutual exclusion" },
+        { type: "sleep", seconds: 0.3 },
+        { type: "send", text: "\r" },
+        { type: "wait_for", text: "Because only one goroutine may touch cache at a time.", timeout: 3 },
+        { type: "send", text: "\r" },
+      ],
+      { ...process.env, HOME: home },
+      home
+    );
+
+    assert.equal(result.code, 0, `pty driver reported a failure: ${result.stderr}`);
+
+    const db = openStore(dbPath);
+    const row = getEventById(db, eventId);
+    db.close();
+    assert.equal(row?.answerConcept, "the answer is a mutex");
+    assert.equal(row?.answerInstance, "because it needs mutual exclusion");
+    assert.equal(row?.skipped, false);
+  }
+);
+
+test(
+  "grasp review: Escape shows the concept explanation, and a real answer on the one retry marks the concept learned and shows its sample answer",
+  { timeout: 20_000 },
+  async () => {
+    const { home, dbPath, eventId } = seedHome(shortDiff(), {
+      sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+      sampleAnswerInstance: "Because only one goroutine may touch cache at a time.",
+      conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
+    });
+
+    const result = await runPty(
+      [
+        { type: "wait_for", text: "Concept question:", timeout: 8 },
+        { type: "send", text: "\x1b" }, // first Escape — explain, not an immediate skip
+        { type: "wait_for", text: "A mutex protects a shared resource so only one thread accesses it at once.", timeout: 3 },
+        { type: "send", text: "\r" }, // continue -> back to the concept question, one retry
+        { type: "sleep", seconds: 0.3 },
+        { type: "send", text: "retried real answer" },
+        { type: "sleep", seconds: 0.3 },
+        { type: "send", text: "\r" },
+        { type: "wait_for", text: "A mutex is a mutual-exclusion lock.", timeout: 3 },
+        { type: "send", text: "\r" },
+        { type: "wait_for", text: "Instance question:", timeout: 5 },
+        { type: "send", text: "instance answer text" },
+        { type: "sleep", seconds: 0.3 },
+        { type: "send", text: "\r" },
+        { type: "wait_for", text: "Because only one goroutine may touch cache at a time.", timeout: 3 },
+        { type: "send", text: "\r" },
+      ],
+      { ...process.env, HOME: home },
+      home
+    );
+
+    assert.equal(result.code, 0, `pty driver reported a failure: ${result.stderr}`);
+
+    const db = openStore(dbPath);
+    const row = getEventById(db, eventId);
+    const tags = getConceptTagsByEventId(db, eventId);
+    db.close();
+    assert.equal(row?.answerConcept, "retried real answer", "the retry's real answer must be recorded, not discarded");
+    assert.equal(row?.answerInstance, "instance answer text");
+    assert.equal(row?.skipped, false, "a real answer on the retry must never count as a skip");
+    assert.ok(
+      tags.some((t) => t.tag === "mutex-vs-channel" && t.answered),
+      "the concept tag must flip to answered once the retry produces a real answer"
+    );
+  }
+);
+
+test(
+  "grasp review: declining both attempts on a question shows its sample answer before moving on, without marking the concept learned",
+  { timeout: 20_000 },
+  async () => {
+    const { home, dbPath, eventId } = seedHome(shortDiff(), {
+      sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
+      sampleAnswerInstance: "Because only one goroutine may touch cache at a time.",
+      conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
+    });
+
+    const result = await runPty(
+      [
+        { type: "wait_for", text: "Concept question:", timeout: 8 },
+        { type: "send", text: "\x1b" }, // first decline -> explain
+        { type: "sleep", seconds: 0.4 },
+        { type: "send", text: "\r" }, // continue -> retry
+        { type: "sleep", seconds: 0.4 },
+        { type: "send", text: "\x1b" }, // decline again -> terminal for concept
+        { type: "wait_for", text: "A mutex is a mutual-exclusion lock.", timeout: 3 },
+        { type: "send", text: "\r" }, // continue -> instance
+        { type: "wait_for", text: "Instance question:", timeout: 5 },
+        { type: "send", text: "\x1b" }, // first decline -> explain
+        { type: "sleep", seconds: 0.4 },
+        { type: "send", text: "\r" }, // continue -> retry
+        { type: "sleep", seconds: 0.4 },
+        { type: "send", text: "\x1b" }, // decline again -> terminal for instance, closes the event
+        { type: "wait_for", text: "Because only one goroutine may touch cache at a time.", timeout: 3 },
+        { type: "send", text: "\r" },
+      ],
+      { ...process.env, HOME: home },
+      home
+    );
+
+    assert.equal(result.code, 0, `pty driver reported a failure: ${result.stderr}`);
+
+    const db = openStore(dbPath);
+    const row = getEventById(db, eventId);
+    const tags = getConceptTagsByEventId(db, eventId);
+    db.close();
+    assert.equal(row?.skipped, true, "declining the instance phase (always the last phase) marks the whole event skipped");
+    assert.equal(row?.answerConcept, null, "no real answer was ever given for the concept question");
+    assert.equal(row?.answerInstance, null);
+    assert.ok(
+      tags.every((t) => !t.answered),
+      "the concept tag must stay unanswered when the concept question was declined on both attempts"
+    );
+  }
+);
+
+test(
+  "grasp review: a legacy event with no sample answers or concept explanation reviews without error, with no broken reveal/explain screen",
+  { timeout: 20_000 },
+  async () => {
+    // No sample-answer/explanation extras passed — this reproduces exactly
+    // what a pre-migration row looks like (the three new columns genuinely
+    // NULL, the same as `openStore`'s migration would leave an existing
+    // row, not a stand-in for it).
+    const { home, dbPath, eventId } = seedHome(shortDiff());
+    const dumpPath = path.join(mkTempDir("grasp-test-ptydump-"), "capture.bin");
+
+    const result = await runPty(
+      [
+        { type: "wait_for", text: "Concept question:", timeout: 8 },
+        // Legacy fallback: no explanation to show, so Escape must behave
+        // like the pre-this-feature immediate skip — no explain screen, no
+        // retry offered.
+        { type: "send", text: "\x1b" },
+        { type: "wait_for", text: "Instance question:", timeout: 5 },
+        // Same fallback for the instance phase — declining it must close
+        // the event immediately, no explain/reveal screen.
+        { type: "send", text: "\x1b" },
+        { type: "sleep", seconds: 0.5 },
+      ],
+      { ...process.env, HOME: home },
+      home,
+      dumpPath
+    );
+
+    assert.equal(result.code, 0, `pty driver reported a failure: ${result.stderr}`);
+
+    const captured = fs.readFileSync(dumpPath, "utf-8");
+    assert.ok(!captured.includes("Stuck?"), "a legacy event with no explanation must never show the explain screen");
+    assert.ok(!captured.includes("Sample answer"), "a legacy event with no sample answer must never show a reveal screen");
+
+    const db = openStore(dbPath);
+    const row = getEventById(db, eventId);
+    db.close();
+    assert.equal(row?.skipped, true);
+    assert.equal(row?.answerConcept, null);
+    assert.equal(row?.answerInstance, null);
+  }
+);

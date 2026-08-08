@@ -24,7 +24,10 @@ const SCHEMA_SQL = `
     skip_reason TEXT,
     cost_usd REAL,
     cost_unknown INTEGER NOT NULL DEFAULT 0,
-    diff_files_json TEXT
+    diff_files_json TEXT,
+    sample_answer_concept TEXT,
+    sample_answer_instance TEXT,
+    concept_explanation TEXT
   );
 
   CREATE TABLE IF NOT EXISTS concept_tags (
@@ -150,6 +153,15 @@ function migrateSchema(db: Database.Database): void {
   if (!eventsColumnNames.has("cost_unknown")) {
     db.exec(`ALTER TABLE events ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`);
   }
+  if (!eventsColumnNames.has("sample_answer_concept")) {
+    db.exec(`ALTER TABLE events ADD COLUMN sample_answer_concept TEXT`);
+  }
+  if (!eventsColumnNames.has("sample_answer_instance")) {
+    db.exec(`ALTER TABLE events ADD COLUMN sample_answer_instance TEXT`);
+  }
+  if (!eventsColumnNames.has("concept_explanation")) {
+    db.exec(`ALTER TABLE events ADD COLUMN concept_explanation TEXT`);
+  }
   // Unconditional (not just inside the branch above): on a fresh install
   // SCHEMA_SQL's CREATE TABLE already includes session_id, so the ALTER
   // above is skipped, but the index still needs creating exactly once —
@@ -221,6 +233,9 @@ function toEventRow(event: EventRecord) {
     costUsd: event.costUsd,
     costUnknown: event.costUnknown ? 1 : 0,
     diffFilesJson: event.diffFiles ? JSON.stringify(event.diffFiles) : null,
+    sampleAnswerConcept: event.sampleAnswerConcept ?? null,
+    sampleAnswerInstance: event.sampleAnswerInstance ?? null,
+    conceptExplanation: event.conceptExplanation ?? null,
   };
 }
 
@@ -244,6 +259,9 @@ function fromEventRow(row: any): EventRecord {
     costUsd: row.cost_usd,
     costUnknown: Boolean(row.cost_unknown),
     diffFiles: row.diff_files_json ? JSON.parse(row.diff_files_json) : null,
+    sampleAnswerConcept: row.sample_answer_concept,
+    sampleAnswerInstance: row.sample_answer_instance,
+    conceptExplanation: row.concept_explanation,
   };
 }
 
@@ -261,12 +279,14 @@ export function insertEvent(
       timestamp, repo, session_id, diff_hash, diff_summary,
       question_concept, question_instance, question_type, generation_source,
       miss_reason, answer_concept, answer_instance,
-      skipped, skip_reason, cost_usd, cost_unknown, diff_files_json
+      skipped, skip_reason, cost_usd, cost_unknown, diff_files_json,
+      sample_answer_concept, sample_answer_instance, concept_explanation
     ) VALUES (
       @timestamp, @repo, @sessionId, @diffHash, @diffSummary,
       @questionConcept, @questionInstance, @questionType, @generationSource,
       @missReason, @answerConcept, @answerInstance,
-      @skipped, @skipReason, @costUsd, @costUnknown, @diffFilesJson
+      @skipped, @skipReason, @costUsd, @costUnknown, @diffFilesJson,
+      @sampleAnswerConcept, @sampleAnswerInstance, @conceptExplanation
     )
   `);
   const insertTagStmt = db.prepare(
@@ -344,17 +364,50 @@ export function markEventAnswered(
 }
 
 /**
- * Marks an event skipped. Per DECISIONS.md's "skip skips the whole event"
- * entry: the schema has one `skipped`/`skip_reason` pair per event, not
- * per sub-question, so this is all-or-nothing even for a "both" question —
- * there's no partial-skip state to represent.
+ * Marks a concept tag learned the moment the CONCEPT phase specifically
+ * concludes with a real, non-blank answer — independent of what happens to
+ * the instance phase afterward (it may still end up declined). Also writes
+ * `answer_concept` immediately, so a partial answer survives even if the
+ * event later ends up recorded skipped (e.g. instance declined twice) — see
+ * DECISIONS.md's "grasp review: explain-then-retry skip flow" entry for why
+ * concept-tag memoization and the event's overall skipped/answered
+ * disposition are no longer the same moment now that each phase can resolve
+ * independently via its own retry attempt.
  */
-export function markEventSkipped(
-  db: Database.Database,
-  eventId: number,
-  skipReason: string | null
-): void {
-  db.prepare(`UPDATE events SET skipped = 1, skip_reason = ? WHERE id = ?`).run(skipReason, eventId);
+export function markConceptAnswered(db: Database.Database, eventId: number, answerConcept: string): void {
+  const runInTransaction = db.transaction(() => {
+    db.prepare(`UPDATE concept_tags SET answered = 1 WHERE event_id = ?`).run(eventId);
+    db.prepare(`UPDATE events SET answer_concept = ? WHERE id = ?`).run(answerConcept, eventId);
+  });
+  runInTransaction();
+}
+
+/**
+ * Writes a real, non-blank instance answer. This is what actually takes an
+ * event out of "pending" (see `PENDING_QUESTION_WHERE`'s `answer_instance IS
+ * NULL` check) — the instance phase is always the last phase in `grasp
+ * review`'s concept-then-instance sequence, so this is called once, at most,
+ * per event.
+ */
+export function markInstanceAnswered(db: Database.Database, eventId: number, answerInstance: string): void {
+  db.prepare(`UPDATE events SET answer_instance = ? WHERE id = ?`).run(answerInstance, eventId);
+}
+
+/**
+ * Marks an event skipped — called once, when the instance phase (always the
+ * last phase) is declined for good, whether that's an old-style immediate
+ * decline (legacy event, no explanation to retry against) or the terminal
+ * decline after a retry attempt. Does not touch `answer_concept`: if the
+ * concept phase was separately answered for real first, `markConceptAnswered`
+ * already persisted it, and this call must not clobber that partial answer.
+ * `skip_reason` is deliberately never written here — the interactive
+ * "why are you skipping?" free-text prompt was removed in favor of the
+ * explain-then-retry flow (see DECISIONS.md's "grasp review: explain-then-
+ * retry skip flow" entry); the column stays in the schema only so existing
+ * historical rows that already have a reason keep it.
+ */
+export function markEventSkipped(db: Database.Database, eventId: number): void {
+  db.prepare(`UPDATE events SET skipped = 1 WHERE id = ?`).run(eventId);
 }
 
 const PENDING_QUESTION_WHERE = `

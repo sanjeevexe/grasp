@@ -52,6 +52,9 @@ if (mode === "brand-new-concept-no-question") {
     conceptTag: "brand-new-concept",
     questionConcept: null,
     questionInstance: "instance question with no concept question first",
+    sampleAnswerConcept: null,
+    sampleAnswerInstance: "sample answer for the instance question",
+    conceptExplanation: "standalone explanation of the concept",
   };
   process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.stringify(result), is_error: false }));
   process.exit(0);
@@ -139,5 +142,8 @@ const result = {
   conceptTag: `test-concept-${n}`,
   questionConcept: `concept question ${n}`,
   questionInstance: `instance question ${n}`,
+  sampleAnswerConcept: `sample answer for concept ${n}`,
+  sampleAnswerInstance: `sample answer for instance ${n}`,
+  conceptExplanation: `explanation for concept ${n}`,
 };
 process.stdout.write(JSON.stringify({ total_cost_usd: cost, result: JSON.stringify(result), is_error: false }));
