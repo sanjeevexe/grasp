@@ -46,7 +46,7 @@ Inside a git repo you want Grasp watching:
 grasp init
 ```
 
-This shows you exactly what it's about to add to `.claude/settings.local.json` (Grasp's hooks for `PreToolUse`, `PostToolUse`, and `Stop`) and asks for confirmation before writing anything. It's per-repo and local-only — it never touches `~/.claude/settings.json` (which would silently apply to every project) or a committed, shared settings file (which would silently opt in every teammate who clones the repo). Run it again in any other repo you want covered.
+This shows you a short summary of what it's about to add to `.claude/settings.local.json` (Grasp's hooks for `PreToolUse`, `PostToolUse`, and `Stop`) and asks for confirmation before writing anything — type `v` at the prompt to see the exact, literal JSON it will write, if you want to check the bytes yourself before trusting it. It's per-repo and local-only — it never touches `~/.claude/settings.json` (which would silently apply to every project) or a committed, shared settings file (which would silently opt in every teammate who clones the repo). Run it again in any other repo you want covered.
 
 `grasp init`'s confirmation step is also where Grasp states plainly, before anything is installed, that generating questions draws on your existing Claude plan/usage — see [What gets sent where, and what it costs](#what-gets-sent-where-and-what-it-costs).
 
@@ -58,7 +58,7 @@ Just use Claude Code normally in that repo. Grasp works in the background — th
 grasp review
 ```
 
-This opens an interactive terminal view of every question you haven't answered or skipped yet, across every repo Grasp is watching (not just the one you're sitting in — a question is about something you learned, not about where you happened to be standing). Each question shows the diff it's about, then a concept question, then an instance question. Type your answer and press Enter, or press Escape to skip (skipping always takes a real keypress — it's never silent or automatic). If several questions piled up from one long session, they're grouped so you work through one session's worth before moving to the next, with a running count so you can see how much is left.
+This opens an interactive terminal view of every question you haven't answered or skipped yet, across every repo Grasp is watching (not just the one you're sitting in — a question is about something you learned, not about where you happened to be standing). Each question shows the diff it's about, then a concept question, then an instance question. The answer field is focused and ready to type in the moment a question appears — no extra keypress needed first. If the diff has more lines than fit on screen, use the up/down arrow keys to scroll it (works whether or not you've started typing). Type your answer and press Enter, or press Escape to skip (skipping always takes a real keypress — it's never silent or automatic; a blank Enter is rejected with a message, not treated as a skip). If several questions piled up from one long session, they're grouped so you work through one session's worth before moving to the next, with a running count so you can see how much is left.
 
 ## What gets sent where, and what it costs
 

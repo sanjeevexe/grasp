@@ -11,7 +11,8 @@ Everything below is there to help you notice specific things, in plain terms, wi
 - [ ] Check `node --version` is 22 or newer — Grasp (and its `better-sqlite3` dependency) won't install on an older Node.
 - [ ] Install Grasp: `npm install`, `npm run build`, `npm link` from the project folder.
 - [ ] Check `grasp --version` prints something.
-- [ ] In a real repo you actually work in, run `grasp init`. Before it writes anything, it should show you exactly what it's about to add and explain — in plain language — that generating questions uses your existing Claude account (your subscription or your API billing, not some hidden third thing). **Read that message once for real.** Then say yes.
+- [ ] In a real repo you actually work in, run `grasp init`. Before it writes anything, it should show you a short summary of which hook(s) it's adding and explain — in plain language — that generating questions uses your existing Claude account (your subscription or your API billing, not some hidden third thing). **Read that message once for real.** Then say yes.
+- [ ] Run `grasp init` again in a fresh repo (or delete the settings file first) and, at the "Apply these changes?" prompt, type `v` and press Enter instead of answering directly. Confirm it shows you the exact, literal JSON it's about to write (not a summary) — then confirm you can still answer `y`/`N` right after to actually apply or abort.
 - [ ] Confirm it created a `.claude/settings.local.json` file with Grasp's entries in it, and that running `grasp init` again doesn't duplicate anything.
 
 ## 1. Does it actually notice real work?
@@ -37,7 +38,10 @@ This is the most important, least mechanical thing to judge — nothing below is
 ## 3. Answering and skipping
 
 - [ ] Run `grasp review`. Confirm it shows you the actual code change alongside the question, in a way you can read clearly.
+- [ ] The moment a question appears, start typing immediately — no need to press Enter or any other key first. Confirm your keystrokes show up in the answer field right away.
 - [ ] If a diff has a genuinely long line (a long condition, a long error message), confirm it wraps onto the next line instead of getting cut off — you should be able to read every character of it somewhere on screen.
+- [ ] If a diff has more lines than fit on screen (look for the "N more lines below" hint), press the down arrow a few times and confirm the diff actually scrolls — try this both before typing anything and after you've already started typing an answer. Press up to scroll back.
+- [ ] Press Enter with the answer field still blank. Confirm you get a clear "a blank answer isn't accepted" message, not a silent no-op — then just type a real answer and press Enter again; it should submit normally, with no extra keypress needed.
 - [ ] Type a real answer and press Enter. Go check — did it actually save? (You can look in the SQLite database directly if curious: `sqlite3 ~/.grasp/history.db "select answer_concept, answer_instance from events order by id desc limit 1;"`)
 - [ ] Try to skip a question by doing nothing for a few seconds. Confirm nothing happens automatically — it should never disappear on its own.
 - [ ] Now actually skip one on purpose (press Escape). Confirm it required you to actually press a key — it shouldn't feel accidental or free.

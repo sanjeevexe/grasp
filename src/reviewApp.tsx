@@ -93,7 +93,6 @@ const LINE_COLOR: Record<RenderLine["kind"], string | undefined> = {
 };
 
 type Phase = "concept" | "instance" | "skip-reason";
-type Mode = "viewing" | "answering";
 
 export function createReviewApp({ ink, TextInput }: InkModules) {
   const { Box, Text, useInput, useApp } = ink;
@@ -155,11 +154,15 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
 
     const hasConceptQuestion = Boolean(event.questionConcept);
     const [phase, setPhase] = useState<Phase>(hasConceptQuestion ? "concept" : "instance");
-    const [mode, setMode] = useState<Mode>("viewing");
     const [conceptAnswer, setConceptAnswer] = useState("");
     const [instanceAnswer, setInstanceAnswer] = useState("");
-    const [skipReasonText, setSkipReasonText] = useState("");
     const [inputValue, setInputValue] = useState("");
+    // True only after a real Enter-while-blank submit attempt (not just
+    // "the field happens to be empty right now") — see DECISIONS.md's
+    // "grasp review: immediate focus, working scroll, no premature blank
+    // warning" entry for why this is tracked separately from "is the field
+    // currently empty."
+    const [blankSubmitAttempted, setBlankSubmitAttempted] = useState(false);
 
     const questionText = phase === "concept" ? event.questionConcept : phase === "instance" ? event.questionInstance : null;
 
@@ -177,62 +180,80 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
       setScrollOffset((o) => Math.min(o, Math.max(0, lines.length - maxDiffRows)));
     }, [lines, maxDiffRows]);
 
-    useInput(
-      (input, key) => {
-        if (mode !== "viewing") return;
+    // Always active — the answer field (TextInput, below) is focused from
+    // the moment the question renders, with no separate "viewing" mode to
+    // switch out of first (see DECISIONS.md's entry for why that mode was
+    // removed: it was the direct cause of a real "have to press Enter once
+    // before typing does anything" bug). Up/down arrow scrolls the diff
+    // concurrently with typing — safe because ink-text-input's own input
+    // handling explicitly ignores up/down arrows (confirmed by reading
+    // node_modules/ink-text-input/build/index.js, not assumed), so both
+    // this handler and TextInput's can be active on the same keypress
+    // without conflict, the same way Escape already worked below. Note
+    // this means 'j'/'k' are no longer scroll shortcuts — the old
+    // viewing-only mode could safely treat single letters as hotkeys since
+    // no text field was ever active then, but a global handler can't
+    // consume ordinary letters without breaking anyone whose answer uses
+    // them.
+    //
+    // Wrapped in useCallback: ink's own `useInput` re-subscribes its stdin
+    // listener whenever the handler function reference changes (confirmed
+    // by reading node_modules/ink/build/hooks/use-input.js — the listener
+    // effect's dependency array includes the handler itself). An inline
+    // arrow function here would get a new reference on every keystroke's
+    // resulting re-render, tearing down and re-adding the listener each
+    // time — which is exactly what was silently dropping most rapid
+    // scroll keypresses before this fix (reproduced empirically: 5 down-
+    // arrow presses 150ms apart registered only 2 scroll steps).
+    const handleGlobalInput = useCallback(
+      (_input: string, key: { escape: boolean; upArrow: boolean; downArrow: boolean }) => {
         if (key.escape) {
-          setPhase("skip-reason");
-          setMode("answering");
-          setInputValue("");
+          if (phase !== "skip-reason") {
+            setPhase("skip-reason");
+            setInputValue("");
+            setBlankSubmitAttempted(false);
+          }
           return;
         }
-        if (key.return || input === "a") {
-          setMode("answering");
-          setInputValue(phase === "concept" ? conceptAnswer : phase === "instance" ? instanceAnswer : "");
-          return;
-        }
-        if (key.downArrow || input === "j") {
+        if (key.downArrow) {
           setScrollOffset((o) => Math.min(o + 1, Math.max(0, lines.length - maxDiffRows)));
           return;
         }
-        if (key.upArrow || input === "k") {
+        if (key.upArrow) {
           setScrollOffset((o) => Math.max(0, o - 1));
           return;
         }
       },
-      { isActive: mode === "viewing" }
+      [phase, lines.length, maxDiffRows]
     );
+    useInput(handleGlobalInput);
 
-    // A separate always-active listener just for Escape while answering —
-    // TextInput's own input handling never consumes Escape (it's not a
-    // character it inserts), so both can be active without conflict.
-    useInput(
-      (_input, key) => {
-        if (mode === "answering" && phase !== "skip-reason" && key.escape) {
-          setPhase("skip-reason");
-          setInputValue("");
-        }
-      },
-      { isActive: mode === "answering" && phase !== "skip-reason" }
-    );
+    const handleInputChange = useCallback((value: string) => {
+      setInputValue(value);
+      // Typing anything clears a previous rejection warning immediately —
+      // it should never linger once the user has started correcting it.
+      if (value.trim().length > 0) setBlankSubmitAttempted(false);
+    }, []);
 
     const submitCurrentPhase = useCallback(
       (value: string) => {
         // A blank/whitespace-only submission is never a real answer — see
         // DECISIONS.md's "Blank-answer rejection" entry. Pressing Enter on
-        // empty input during "answering" simply does nothing (stays put,
-        // no state change); the skip-reason prompt is the one phase where
-        // blank IS a legitimate submission (the reason itself is optional
-        // per brief §3.1 — only the concept/instance ANSWER text must be
-        // real, not the skip explanation).
+        // empty input simply does nothing (stays put, no state change) —
+        // the skip-reason prompt is the one phase where blank IS a
+        // legitimate submission (the reason itself is optional per brief
+        // §3.1 — only the concept/instance ANSWER text must be real, not
+        // the skip explanation).
         if (phase !== "skip-reason" && value.trim().length === 0) {
+          setBlankSubmitAttempted(true);
           return;
         }
         if (phase === "concept") {
           setConceptAnswer(value);
           if (hasConceptQuestion && event.questionInstance) {
             setPhase("instance");
-            setMode("viewing");
+            setInputValue(instanceAnswer);
+            setBlankSubmitAttempted(false);
             setScrollOffset(0);
           } else {
             onDone({ type: "answered", answers: { answerConcept: value, answerInstance: null } });
@@ -252,8 +273,10 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
         // phase === "skip-reason"
         onDone({ type: "skipped", skipReason: value.trim().length > 0 ? value.trim() : null });
       },
-      [phase, hasConceptQuestion, conceptAnswer, event.questionInstance, onDone]
+      [phase, hasConceptQuestion, conceptAnswer, instanceAnswer, event.questionInstance, onDone]
     );
+
+    const showBlankWarning = phase !== "skip-reason" && blankSubmitAttempted && inputValue.trim().length === 0;
 
     return (
       <Box flexDirection="column">
@@ -273,25 +296,19 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
             </Text>
           )}
         </Box>
-        <Box marginTop={1}>
-          {mode === "viewing" ? (
-            <Text dimColor>[Enter] or [a] to answer   [↑/↓] scroll diff   [Esc] skip</Text>
+        <Box marginTop={1} flexDirection="column">
+          <TextInput
+            value={inputValue}
+            onChange={handleInputChange}
+            onSubmit={submitCurrentPhase}
+            placeholder={phase === "skip-reason" ? "press Enter to leave blank" : "type your answer, Enter to submit"}
+          />
+          {showBlankWarning ? (
+            <Text color="yellow">A blank answer isn't accepted — type something, or press Esc to skip instead.</Text>
+          ) : phase === "skip-reason" ? (
+            <Text dimColor>[Enter] submit (blank = no reason given)   (terminal: {columns}x{rows})</Text>
           ) : (
-            <Box flexDirection="column">
-              <TextInput
-                value={inputValue}
-                onChange={setInputValue}
-                onSubmit={submitCurrentPhase}
-                placeholder={phase === "skip-reason" ? "press Enter to leave blank" : "type your answer, Enter to submit"}
-              />
-              {phase !== "skip-reason" && inputValue.trim().length === 0 ? (
-                <Text color="yellow">A blank answer isn't accepted — type something, or press Esc to skip instead.</Text>
-              ) : phase === "skip-reason" ? (
-                <Text dimColor>[Enter] submit (blank = no reason given)   (terminal: {columns}x{rows})</Text>
-              ) : (
-                <Text dimColor>[Enter] submit   [Esc] skip this question   (terminal: {columns}x{rows})</Text>
-              )}
-            </Box>
+            <Text dimColor>[Enter] submit   [↑/↓] scroll diff   [Esc] skip   (terminal: {columns}x{rows})</Text>
           )}
         </Box>
       </Box>

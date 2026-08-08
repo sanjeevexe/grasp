@@ -64,13 +64,44 @@ function entriesEqual(a: HookEntry, b: HookEntry): boolean {
   return a.hooks.every((h, i) => h.type === b.hooks[i].type && h.command === b.hooks[i].command && h.timeout === b.hooks[i].timeout);
 }
 
-function askConfirmation(question: string): Promise<boolean> {
+/**
+ * Prompts with `question` in a loop: a `v`/`view` answer prints `jsonPreview`
+ * (the real, literal JSON Grasp will write — never a summary) and re-asks;
+ * any other answer resolves the confirmation the normal y/N way. See
+ * DECISIONS.md's "grasp init: collapse JSON preview by default" entry for
+ * why this single-prompt "v to view" shape was chosen over a separate
+ * up-front yes/no view prompt.
+ *
+ * Deliberately uses a persistent `rl.on("line", ...)` listener rather than
+ * chained `rl.question()` calls: on non-TTY (piped) stdin, all of a fast
+ * multi-line answer (e.g. "v\ny\n") can already be buffered by the time the
+ * first line is handled, and `rl.question()` only starts listening for the
+ * NEXT line after it's called again — a line that arrives in the gap before
+ * the second `question()` call is registered has no pending question to
+ * resolve, so readline silently drops it (this was empirically confirmed:
+ * an earlier `rl.question()`-chained version of this loop hung forever on
+ * piped `"v\ny\n"` input, because the "y" line arrived before the second
+ * question was set up and was lost). A single persistent listener has no
+ * such gap — every line is handled by the same always-on handler.
+ */
+function askConfirmationWithView(question: string, jsonPreview: string): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
+    const promptAgain = () => {
+      rl.setPrompt(question);
+      rl.prompt();
+    };
+    rl.on("line", (line) => {
+      const answer = line.trim();
+      if (/^v(iew)?$/i.test(answer)) {
+        process.stdout.write(jsonPreview + "\n");
+        promptAgain();
+        return;
+      }
       rl.close();
-      resolve(/^y(es)?$/i.test(answer.trim()));
+      resolve(/^y(es)?$/i.test(answer));
     });
+    promptAgain();
   });
 }
 
@@ -147,30 +178,37 @@ export async function runInit(repoRoot: string): Promise<void> {
 
   const updatedSettings: ClaudeSettings = { ...existing, hooks };
 
-  const messageLines: string[] = [];
+  // The exact, literal JSON Grasp will write — never shown by default (a
+  // real user found the full three-hook-entry block confusing on first
+  // run), but always available verbatim on request via the confirmation
+  // prompt's "v" option below. This must stay byte-identical in structure
+  // to what actually gets written; see DECISIONS.md's "grasp init preview
+  // must match written JSON shape" entry (the reason this is built from the
+  // same DESIRED/staleBefore values as the write below, not a re-typed
+  // summary) and test/init.test.ts's preview-matches-write test.
+  const jsonPreviewLines: string[] = [];
   if (missing.length > 0) {
-    messageLines.push(
-      `Grasp will add the following hook(s) to ${settingsPath}:`,
+    jsonPreviewLines.push(
+      `Exact JSON Grasp will add to ${settingsPath}:`,
       "",
       // Each event's value in the actual settings file is an ARRAY of hook
       // entries (Claude Code's own schema — see HooksSection above), even
       // though DESIRED[e] here is a single entry. Wrapping it in [...] for
       // the preview is what makes this match the JSON shape actually
       // written below, rather than showing a bare object a reader could
-      // paste in and get wrong — see DECISIONS.md's "grasp init preview
-      // must match written JSON shape" entry.
+      // paste in and get wrong.
       JSON.stringify({ hooks: Object.fromEntries(missing.map((e) => [e, [DESIRED[e]]])) }, null, 2),
       ""
     );
   }
   if (stale.length > 0) {
-    messageLines.push(
-      `Grasp will UPDATE the following existing hook(s) in ${settingsPath} — they were installed`,
-      "by an older version of `grasp init` and are out of date (e.g. a stale timeout value):",
+    jsonPreviewLines.push(
+      `Exact JSON Grasp will UPDATE in ${settingsPath} (existing hook(s) installed by an older`,
+      "version of `grasp init`, out of date — e.g. a stale timeout value):",
       ""
     );
     for (const eventName of stale) {
-      messageLines.push(
+      jsonPreviewLines.push(
         `  ${eventName}:`,
         `    before: ${JSON.stringify([staleBefore.get(eventName)])}`,
         `    after:  ${JSON.stringify([DESIRED[eventName]])}`,
@@ -178,7 +216,19 @@ export async function runInit(repoRoot: string): Promise<void> {
       );
     }
   }
+
+  const messageLines: string[] = [];
+  if (missing.length > 0) {
+    messageLines.push(`Grasp will add hook(s) for: ${missing.join(", ")}  (to ${settingsPath})`);
+  }
+  if (stale.length > 0) {
+    messageLines.push(
+      `Grasp will UPDATE out-of-date hook(s) for: ${stale.join(", ")}  (in ${settingsPath})`,
+      "  — these were installed by an older version of `grasp init` (e.g. a stale timeout value)."
+    );
+  }
   messageLines.push(
+    "",
     `This registers \`${HOOK_COMMAND}\` for ${[...missing, ...stale].join(", ")} so Grasp can observe file`,
     "changes and turn completions during your Claude Code sessions in this repo. It never",
     "modifies a tool call's own input or output. In the default gate mode (soft), it never",
@@ -194,7 +244,7 @@ export async function runInit(repoRoot: string): Promise<void> {
 
   process.stdout.write(messageLines.join("\n"));
 
-  const confirmed = await askConfirmation("Apply these changes? [y/N] ");
+  const confirmed = await askConfirmationWithView("Apply these changes? [y/N]  (or 'v' to view the exact JSON first) ", jsonPreviewLines.join("\n"));
   if (!confirmed) {
     process.stdout.write("Aborted — no changes made.\n");
     return;
