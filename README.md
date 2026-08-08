@@ -19,11 +19,10 @@ Everything is stored locally in a plain SQLite database. Nothing is sent anywher
 
 ## Install
 
-Grasp isn't published to npm yet. For now, build and link it from source:
+Grasp isn't published to npm yet, and this repo doesn't have a public Git remote configured. For now, build and link it from source using the project folder you already have locally:
 
 ```bash
-git clone <this-repo>
-cd grasp
+cd path/to/grasp
 npm install
 npm run build
 npm link
