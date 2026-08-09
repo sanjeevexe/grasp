@@ -1,10 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
-import { spawn } from "child_process";
 import { openStore, insertEvent, getEventById, getConceptTagsByEventId } from "../src/store";
+import { mkTempDir, PtyStep, runPty as runPtyArgs } from "./helpers";
 
 /**
  * Real-pseudo-terminal regression tests for a dogfooding bug report found
@@ -21,47 +20,13 @@ import { openStore, insertEvent, getEventById, getConceptTagsByEventId } from ".
  * differently (or not at all) than it does here.
  */
 
-const CLI_PATH = path.resolve(process.cwd(), "dist/cli.js");
-const PTY_DRIVER = path.resolve(process.cwd(), "test/fixtures/ptyDriver.py");
-
-function mkTempDir(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
-interface PtyStep {
-  type: "wait_for" | "send" | "sleep";
-  text?: string;
-  seconds?: number;
-  timeout?: number;
-}
-
 function runPty(
   steps: PtyStep[],
   env: Record<string, string>,
   cwd: string,
   dumpPath?: string
 ): Promise<{ code: number | null; stderr: string }> {
-  const specPath = path.join(mkTempDir("grasp-test-ptyspec-"), "spec.json");
-  fs.writeFileSync(
-    specPath,
-    JSON.stringify({
-      cmd: ["node", CLI_PATH, "review"],
-      cwd,
-      env,
-      cols: 120,
-      rows: 45,
-      final_wait_seconds: 1.0,
-      steps,
-      dump_path: dumpPath,
-    })
-  );
-  return new Promise((resolve, reject) => {
-    const child = spawn("python3", [PTY_DRIVER, specPath], { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code, stderr }));
-  });
+  return runPtyArgs(["review"], steps, env, cwd, dumpPath);
 }
 
 interface SeedExtras {
@@ -82,7 +47,12 @@ function seedHome(
   diffFiles: Parameters<typeof insertEvent>[1]["diffFiles"],
   extras: SeedExtras = {}
 ): { home: string; dbPath: string; eventId: number } {
-  const home = mkTempDir("grasp-test-pty-home-");
+  // realpath'd: on macOS, os.tmpdir() paths run through a /var ->
+  // /private/var symlink, and a real child process's own process.cwd()
+  // resolves through that symlink after chdir'ing — an un-resolved `home`
+  // stored as the event's `repo` would silently never match what
+  // `resolveRepoRoot` reports back inside the pty-spawned process.
+  const home = fs.realpathSync(mkTempDir("grasp-test-pty-home-"));
   const dbPath = path.join(home, ".grasp", "history.db");
   // openStore(dbPath) only ever mkdir's the DEFAULT GRASP_HOME (~/.grasp),
   // not the parent of whatever custom dbPath is passed in — so a scratch
@@ -93,7 +63,15 @@ function seedHome(
     db,
     {
       timestamp: new Date().toISOString(),
-      repo: "/tmp/pty-test-repo",
+      // Must match the `home` dir the pty is actually launched from (see
+      // `runPty`'s `cwd` argument below) — `grasp review` now defaults to
+      // scoping to the resolved repo root of its cwd (see the "grasp review
+      // defaults to the current repo" DECISIONS.md entry), and `home` isn't
+      // a git work tree, so `resolveRepoRoot` falls back to `home` itself.
+      // A mismatched hardcoded repo string here would make every one of
+      // these seeded events invisible to the default (unscoped-by-`--all`)
+      // review these tests exercise.
+      repo: home,
       sessionId: null,
       diffHash: "pty-test-hash",
       diffSummary: "1 file changed",

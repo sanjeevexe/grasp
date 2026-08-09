@@ -32,7 +32,8 @@ Usage:
   grasp --version                Print the installed version
   grasp --help                   Show this help
   grasp init                     Install Grasp's Claude Code hooks into this repo (asks for confirmation)
-  grasp review                   Work through pending comprehension questions, interactively
+  grasp review                   Work through pending comprehension questions for this repo, interactively
+  grasp review --all             Same, but across every repo Grasp has ever touched
   grasp debug:seed               (dev) Insert one fake event + concept tag, for verifying the local store
   grasp debug:capture <repo>     (dev) Run git-diff capture against <repo> and print the resulting diff object
   grasp debug:answer <event-id>  (dev) Simulate answering an event's concept question (marks its concept tag(s) answered)
@@ -423,7 +424,11 @@ async function main(): Promise<void> {
   }
 
   if (command === "review") {
-    await runReview();
+    // Hand-rolled, matching this codebase's existing no-framework argument
+    // handling (see DECISIONS.md's "No CLI argument-parsing framework"
+    // entry) — a single boolean flag doesn't justify pulling one in.
+    const all = args.slice(1).includes("--all");
+    await runReview({ all });
     return;
   }
 

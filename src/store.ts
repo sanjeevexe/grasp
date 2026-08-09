@@ -417,20 +417,31 @@ const PENDING_QUESTION_WHERE = `
 `;
 
 /**
- * Every real (non-miss), unanswered, unskipped question across ALL repos —
- * deliberately global, matching the project's existing concept-tag
- * memoization precedent, not scoped to the current working directory's
- * repo. See DECISIONS.md's "grasp review query scope" entry for why.
- * `answer_instance IS NULL` alone is a reliable "not yet answered" check:
- * every real question (question_type "both" or "instance") always has a
- * non-null question_instance and gets it answered last in `review`'s
- * concept-then-instance sequence, so it's null iff the event is still
- * pending regardless of question_type.
+ * Every real (non-miss), unanswered, unskipped question, optionally narrowed
+ * to one repo. `repoRoot` omitted (or undefined) preserves the original
+ * all-repos behavior `grasp review --all` now relies on; passed, it adds a
+ * `repo = ?` condition on top of the same `PENDING_QUESTION_WHERE`
+ * definition — this does NOT change what counts as "pending" (concept-tag
+ * memoization stays global, untouched by this), only which already-pending
+ * rows get returned. See DECISIONS.md's "grasp review defaults to the
+ * current repo" entry, which supersedes the earlier "query scope: global"
+ * entry now that a real dogfooding session showed the global default
+ * actively confusing users. `answer_instance IS NULL` alone is a reliable
+ * "not yet answered" check: every real question (question_type "both" or
+ * "instance") always has a non-null question_instance and gets it answered
+ * last in `review`'s concept-then-instance sequence, so it's null iff the
+ * event is still pending regardless of question_type.
  */
-export function getPendingQuestions(db: Database.Database): EventRecord[] {
+export function getPendingQuestions(db: Database.Database, repoRoot?: string): EventRecord[] {
+  if (repoRoot === undefined) {
+    const rows = db
+      .prepare(`SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} ORDER BY timestamp ASC`)
+      .all();
+    return rows.map(fromEventRow);
+  }
   const rows = db
-    .prepare(`SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} ORDER BY timestamp ASC`)
-    .all();
+    .prepare(`SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} AND repo = ? ORDER BY timestamp ASC`)
+    .all(repoRoot);
   return rows.map(fromEventRow);
 }
 

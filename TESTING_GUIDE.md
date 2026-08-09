@@ -48,6 +48,9 @@ This is the most important, least mechanical thing to judge — nothing below is
 - [ ] Press any key to continue past that explanation. Confirm you're back at the same question, able to type — this is your one retry. Type a real answer this time and confirm it's accepted normally (sample answer shown, same as any other real answer).
 - [ ] On a different question, press Escape, continue past the explanation, then press Escape again instead of answering. Confirm this is what actually skips — it required two deliberate keypresses with a real explanation in between, not one accidental tap — and confirm you still see the sample answer for that question before it moves on, even though you didn't answer it.
 - [ ] If you get a batch of several questions at once (e.g. after a long task), does working through them feel coherent — like one related batch — rather than a random jumbled list?
+- [ ] If you use Grasp in more than one repo, run `grasp review` from inside just one of them. Confirm you only see that repo's own pending questions, not a mix from every repo Grasp has ever touched.
+- [ ] Run `grasp review --all` instead. Confirm you now see pending questions from every repo, same as before this scoping was added.
+- [ ] With no pending questions in your current repo but at least one pending somewhere else, run `grasp review`. Confirm it tells you plainly that nothing's pending *here* but some are pending elsewhere, and tells you to run `grasp review --all` to see them — rather than just showing an empty "all caught up" screen.
 
 ## 4. The "nudge" vs. the "hard stop"
 

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { loadInk } from "./inkLoader";
+import { resolveRepoRoot } from "./git";
 import { createReviewApp, ReviewQueueItem } from "./reviewApp";
 import { EventRecord } from "./types";
 import { getPendingQuestions, markConceptAnswered, markEventSkipped, markInstanceAnswered, openStore } from "./store";
@@ -46,13 +47,16 @@ function groupForBatchPresentation(events: EventRecord[]): ReviewQueueItem[] {
 
 /**
  * `grasp review` — the one place in the codebase with genuine terminal
- * access (see DECISIONS.md's TTY-access finding). Queries pending
- * questions globally across all repos (see the "grasp review query scope"
- * entry), groups/orders them into a coherent batch (Phase 8), renders them
- * one at a time via ink, and writes answers/skips straight back to the
- * store.
+ * access (see DECISIONS.md's TTY-access finding). Defaults to only the
+ * current repo's pending questions (resolved the same way `grasp init`/the
+ * hooks resolve repo root — see `resolveRepoRoot`); `--all` bypasses that
+ * filter for the full cross-repo batch. See DECISIONS.md's "grasp review
+ * defaults to the current repo" entry (supersedes the earlier "query scope:
+ * global" entry) for why. Groups/orders whatever list it ends up with into
+ * a coherent batch (Phase 8), renders them one at a time via ink, and
+ * writes answers/skips straight back to the store.
  */
-export async function runReview(): Promise<void> {
+export async function runReview(options: { all?: boolean } = {}): Promise<void> {
   if (!process.stdin.isTTY) {
     process.stderr.write(
       "grasp review needs an interactive terminal (stdin is not a TTY) — run it directly in a terminal, not piped or scripted.\n"
@@ -62,9 +66,20 @@ export async function runReview(): Promise<void> {
   }
 
   const db = openStore();
-  const pending = getPendingQuestions(db);
+  const repoRoot = resolveRepoRoot(process.cwd());
+  const pending = options.all ? getPendingQuestions(db) : getPendingQuestions(db, repoRoot);
 
   if (pending.length === 0) {
+    if (!options.all) {
+      const elsewhereCount = getPendingQuestions(db).length;
+      if (elsewhereCount > 0) {
+        process.stdout.write(
+          `No pending questions for this repo. ${elsewhereCount} question${elsewhereCount === 1 ? "" : "s"} pending in other repos — run \`grasp review --all\` to see them.\n`
+        );
+        db.close();
+        return;
+      }
+    }
     process.stdout.write("No pending questions — you're caught up.\n");
     db.close();
     return;
