@@ -13,6 +13,7 @@ export const DEFAULT_CONFIG: GraspConfig = {
     maxTotalChangedLines: 1500,
     maxSingleFileChangedLines: 800,
   },
+  difficultyMode: "medium",
 };
 
 export interface LoadedConfig {
@@ -63,12 +64,15 @@ function readJsonFile(filePath: string): unknown {
 
 const GATE_MODES = ["soft", "hard"] as const;
 
+const DIFFICULTY_MODES = ["easy", "medium", "hard"] as const;
+
 const KNOWN_TOP_LEVEL_KEYS = [
   "gateMode",
   "costCapUsd",
   "ignorePatterns",
   "questionsPerSessionCap",
   "diffThresholds",
+  "difficultyMode",
 ] as const;
 
 const KNOWN_DIFF_THRESHOLD_KEYS = [
@@ -142,6 +146,12 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
     if (!Number.isInteger(value.questionsPerSessionCap) || (value.questionsPerSessionCap as number) < 1) {
       errors.push(`questionsPerSessionCap must be a positive integer, got ${JSON.stringify(value.questionsPerSessionCap)}`);
     }
+  }
+
+  if (value.difficultyMode !== undefined && !DIFFICULTY_MODES.includes(value.difficultyMode as any)) {
+    errors.push(
+      `difficultyMode must be one of ${DIFFICULTY_MODES.map((m) => `"${m}"`).join(" | ")}, got ${JSON.stringify(value.difficultyMode)}`
+    );
   }
 
   if (value.diffThresholds !== undefined) {
@@ -230,4 +240,54 @@ export function loadConfig(
   const repoOverride = readAndValidateConfigFile(repoConfigPath);
   const merged = deepMerge(globalConfig, repoOverride);
   return { config: merged, globalConfigPath, repoConfigPath };
+}
+
+/**
+ * Reads an existing config file (if present) as a plain object, sets a
+ * single top-level key, re-validates the WHOLE resulting object through
+ * `validateConfigOverride`, and writes it back — preserving every other key
+ * already in the file untouched. Used by `grasp set mode/gate/questions-cap`
+ * for both the global and repo-scoped case, per the shared read-modify-write
+ * contract those commands need (see DECISIONS.md's "grasp set: read-modify-
+ * write config path" entry). Re-validating the full object (not just the
+ * changed key) means a file with a pre-existing invalid value elsewhere is
+ * caught here too, same as any other config load — it never gets silently
+ * written back over.
+ */
+export function setConfigValue(filePath: string, key: string, value: unknown): void {
+  let existing: Record<string, unknown> = {};
+  if (fs.existsSync(filePath)) {
+    existing = readAndValidateConfigFile(filePath);
+  }
+  const updated: Record<string, unknown> = { ...existing, [key]: value };
+  validateConfigOverride(updated, filePath);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(updated, null, 2) + "\n", "utf-8");
+}
+
+/**
+ * Resets global config back to `DEFAULT_CONFIG`, same shape/contents
+ * `ensureGlobalConfigFile` writes on a genuine first run. Overwrites
+ * unconditionally (unlike `ensureGlobalConfigFile`, which never touches an
+ * existing file) — this IS the reset action.
+ */
+export function resetGlobalConfigFile(
+  globalConfigPath: string = GLOBAL_CONFIG_PATH,
+  graspHome: string = GRASP_HOME
+): void {
+  fs.mkdirSync(graspHome, { recursive: true });
+  fs.writeFileSync(globalConfigPath, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", "utf-8");
+}
+
+/**
+ * Resets repo-level config by deleting `.grasp.json` if present — see
+ * DECISIONS.md's "grasp reset config (local): delete vs empty-out" entry for
+ * why deletion (not writing back an empty `{}`) is the chosen behavior.
+ * Returns true if a file was actually deleted, false if there was nothing to
+ * remove (so callers can print an accurate confirmation either way).
+ */
+export function resetRepoConfigFile(repoConfigPath: string): boolean {
+  if (!fs.existsSync(repoConfigPath)) return false;
+  fs.unlinkSync(repoConfigPath);
+  return true;
 }

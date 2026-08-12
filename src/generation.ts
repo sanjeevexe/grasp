@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import Database from "better-sqlite3";
 import { DiffFile } from "./adapters/agentAdapter";
-import { GraspConfig } from "./types";
+import { DifficultyMode, GraspConfig } from "./types";
 import {
   GENERATION_RESERVATION_STALE_MS,
   getAllAnsweredConceptTags,
@@ -84,9 +84,29 @@ function formatDiffForPrompt(files: DiffFile[]): string {
     .join("\n\n");
 }
 
-function buildJudgePrompt(diffText: string, answeredTags: string[]): string {
+/**
+ * Additional judge-prompt instruction for `difficultyMode` "easy"/"hard" —
+ * a soft nudge on which candidate CONCEPT the judge picks when a diff
+ * genuinely offers more than one reasonable one, never a hard filter (a
+ * diff that only really offers one reasonable concept either way should
+ * still produce a question). `"medium"` (the default) adds nothing, leaving
+ * the existing, already-shipped prompt behavior unchanged — see
+ * DECISIONS.md's "difficultyMode scope" entry for why this only touches
+ * concept SELECTION, not how deeply a chosen concept's question is written.
+ */
+function difficultyModeInstruction(difficultyMode: DifficultyMode): string {
+  if (difficultyMode === "easy") {
+    return "\n\nConcept-selection preference: when this diff genuinely offers more than one reasonable candidate concept to ask about, prefer the more foundational/basic one. If the diff only really offers one reasonable concept, ask about that one regardless of this preference.";
+  }
+  if (difficultyMode === "hard") {
+    return "\n\nConcept-selection preference: when this diff genuinely offers more than one reasonable candidate concept to ask about, prefer the more advanced/less obvious one. If the diff only really offers one reasonable concept, ask about that one regardless of this preference.";
+  }
+  return "";
+}
+
+function buildJudgePrompt(diffText: string, answeredTags: string[], difficultyMode: DifficultyMode = "medium"): string {
   const answeredList = answeredTags.length > 0 ? answeredTags.join(", ") : "none yet";
-  return `You are a code-comprehension tutor helping a developer understand a change an AI coding agent just made to their own codebase.
+  return `You are a code-comprehension tutor helping a developer understand a change an AI coding agent just made to their own codebase.${difficultyModeInstruction(difficultyMode)}
 
 Below is a diff the agent produced. Decide, in this single response:
 1. Is this diff worth asking the developer a comprehension question about? Trivial, self-explanatory, or purely mechanical changes are not worth asking about.
@@ -558,10 +578,10 @@ function runJudgeAndRecord(
   params: GenerationParams,
   diffSummary: string
 ): GenerationOutcome {
-  const { sessionId, significantFiles } = params;
+  const { sessionId, significantFiles, config } = params;
   const answeredTags = getAllAnsweredConceptTags(db);
   const diffText = formatDiffForPrompt(significantFiles);
-  const prompt = buildJudgePrompt(diffText, answeredTags);
+  const prompt = buildJudgePrompt(diffText, answeredTags, config.difficultyMode);
 
   let envelope: ClaudeEnvelope;
   try {

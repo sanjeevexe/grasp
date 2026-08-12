@@ -319,6 +319,53 @@ export function getEventsByRepo(db: Database.Database, repo: string): EventRecor
   return rows.map(fromEventRow);
 }
 
+/**
+ * Every event row across every repo, oldest first — the "everything in the
+ * events table" query `grasp export`'s three shapes all start from (see
+ * export.ts). Distinct from `getEventsByRepo` (one repo) and
+ * `getPendingQuestions` (only unanswered/unskipped) — export intentionally
+ * wants every row regardless of repo or answered/skipped/miss status, each
+ * shape then narrows/reshapes it independently.
+ */
+export function getAllEvents(db: Database.Database): EventRecord[] {
+  const rows = db.prepare(`SELECT * FROM events ORDER BY timestamp ASC`).all();
+  return rows.map(fromEventRow);
+}
+
+/**
+ * Every column of every `events` row, completely unmapped/uncurated —
+ * exactly what `grasp export --raw` promises ("the escape hatch for anyone
+ * who wants everything"). Deliberately bypasses `fromEventRow` (which
+ * reshapes/renames columns for the rest of the codebase's convenience) so
+ * the raw export's column names match the actual schema 1:1.
+ */
+export function getAllEventsRawRows(db: Database.Database): Record<string, unknown>[] {
+  return db.prepare(`SELECT * FROM events ORDER BY timestamp ASC`).all() as Record<string, unknown>[];
+}
+
+/**
+ * All concept_tags rows for every event, grouped by event_id — the batch
+ * counterpart to `getConceptTagsByEventId` (single event) used by
+ * `grasp export`'s default/`--anki` shapes so they don't run one query per
+ * event row.
+ */
+export function getConceptTagsGroupedByEvent(db: Database.Database): Map<number, string[]> {
+  const rows = db.prepare(`SELECT event_id, tag FROM concept_tags ORDER BY id ASC`).all() as Array<{
+    event_id: number;
+    tag: string;
+  }>;
+  const grouped = new Map<number, string[]>();
+  for (const row of rows) {
+    const existing = grouped.get(row.event_id);
+    if (existing) {
+      existing.push(row.tag);
+    } else {
+      grouped.set(row.event_id, [row.tag]);
+    }
+  }
+  return grouped;
+}
+
 export function getConceptTagsByEventId(
   db: Database.Database,
   eventId: number
@@ -839,6 +886,40 @@ export function recordHookInvocation(
   db.prepare(
     `INSERT INTO hook_invocations (session_id, prompt_id, event_name, invoked_at) VALUES (?, ?, ?, ?)`
   ).run(key.sessionId, key.promptId, key.eventName, new Date().toISOString());
+}
+
+/**
+ * Row counts for `grasp reset history`'s pre-delete confirmation prompt and
+ * post-delete summary — read separately from the delete itself so the
+ * caller can show "about to delete N/M rows" before asking for
+ * confirmation, not just after.
+ */
+export function getHistoryRowCounts(db: Database.Database): { events: number; conceptTags: number } {
+  const events = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
+  const conceptTags = (db.prepare(`SELECT COUNT(*) AS n FROM concept_tags`).get() as { n: number }).n;
+  return { events, conceptTags };
+}
+
+/**
+ * Wipes stored question/answer history: both `events` and `concept_tags`
+ * (a separate table, `event_id`-linked — clearing only one would leave the
+ * other stale/orphaned, see this file's schema comment). Irreversible;
+ * callers are responsible for confirming with the user first (see
+ * `grasp reset history` in reset.ts). Deliberately does NOT touch
+ * `cc_turns`/`captured_diffs`/`capture_checkpoints`/`hook_invocations`/
+ * `generation_reservations` — those are session/turn bookkeeping, not
+ * "history" in the question/answer sense this command promises to reset,
+ * and clearing them isn't needed for `events`/`concept_tags` to be
+ * consistent with each other.
+ */
+export function clearHistory(db: Database.Database): { events: number; conceptTags: number } {
+  const counts = getHistoryRowCounts(db);
+  const run = db.transaction(() => {
+    db.prepare(`DELETE FROM concept_tags`).run();
+    db.prepare(`DELETE FROM events`).run();
+  });
+  run();
+  return counts;
 }
 
 export function countHookInvocations(

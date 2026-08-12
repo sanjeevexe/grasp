@@ -60,22 +60,35 @@ This is the most important, least mechanical thing to judge — nothing below is
 Grasp defaults to a gentle reminder, not a hard block. Try both:
 
 - [ ] Leave it on default settings. After Claude Code finishes a task with a real pending question, do you see a short message telling you a question is waiting?
-- [ ] Turn on hard-gate mode (edit `~/.grasp/config.json` or a repo's `.grasp.json`, set `"gateMode": "hard"`). With a question still unanswered, try to get Claude Code to do more work in that same session. Confirm it actually refuses until you go answer or skip via `grasp review`.
+- [ ] Turn on hard-gate mode: `grasp set gate hard` (repo-local) or `grasp set gate hard --global` — this replaces hand-editing `~/.grasp/config.json`/`.grasp.json` for this setting, though editing the file directly still works too. With a question still unanswered, try to get Claude Code to do more work in that same session. Confirm it actually refuses until you go answer or skip via `grasp review`.
 - [ ] After answering/skipping, confirm Claude Code is immediately un-blocked again.
-- [ ] Switch back to `"soft"` and confirm the blocking goes away.
+- [ ] Switch back with `grasp set gate soft` and confirm the blocking goes away.
 - [ ] Confirm hard-gate only ever blocks based on *today's* unanswered questions from *that specific session* — an old question from a different day or different project shouldn't reach in and block unrelated work.
 
 ## 5. Cost and spend
 
 - [ ] After a session where at least one question was generated, look for a spend total in the message Claude Code shows you (something like "$0.0043 spent generating comprehension questions this session so far").
 - [ ] Confirm you're not shown a spend message on a quiet turn where nothing was generated (e.g. Claude Code just reading files, no real question produced) — it should stay quiet rather than showing "$0.00" every time.
-- [ ] Lower the cost cap way down (`"costCapUsd": 0.01` in config) and confirm that once you hit it, Grasp actually stops generating new questions for that session rather than quietly going over.
-- [ ] Similarly, lower `"questionsPerSessionCap"` to something small (like 2) and confirm generation stops once you hit that many real questions in one sitting.
+- [ ] Lower the cost cap way down (`"costCapUsd": 0.01` in config — there's no dedicated command for this one, it's hand-edit only) and confirm that once you hit it, Grasp actually stops generating new questions for that session rather than quietly going over.
+- [ ] Similarly, lower the question cap to something small (`grasp set questions-cap 2`, or hand-edit `"questionsPerSessionCap"`) and confirm generation stops once you hit that many real questions in one sitting.
 
 ## 6. Ignoring stuff you don't want questions about
 
 - [ ] Add a folder or filename to `"ignorePatterns"` in a repo's `.grasp.json` (e.g. a `scripts/` folder you don't care about). Touch a file there and confirm no question gets generated about it.
 - [ ] Confirm that ignore rule only applies in that one repo, not everywhere.
+
+## 6b. `grasp set`, `grasp reset`, `grasp export`
+
+- [ ] Run `grasp set mode --easy`, then check `.grasp.json` in that repo — confirm `difficultyMode` is set and any other keys already in that file are untouched.
+- [ ] Run `grasp set gate hard --global`, then check `~/.grasp/config.json` — same untouched-other-keys check.
+- [ ] Run `grasp set questions-cap 3` with a bad value (e.g. `0`, `-1`, `abc`) and confirm it's rejected with a clear usage message, not a silently-written bad config.
+- [ ] Run `grasp reset config` (no `--global`) in a repo with a `.grasp.json` — confirm the file is deleted, not left behind empty.
+- [ ] Run `grasp reset config --global` — confirm `~/.grasp/config.json` is overwritten back to defaults.
+- [ ] Run `grasp reset history` with pending/answered questions in your history. Confirm it asks for `y/N` confirmation and shows the row counts about to be deleted; answer `N` and confirm nothing was deleted.
+- [ ] Run `grasp reset history --yes`. Confirm it deletes without prompting, and reports how many rows were removed from both `events` and `concept_tags` (check directly: `sqlite3 ~/.grasp/history.db "select count(*) from events; select count(*) from concept_tags;"` should both be `0`).
+- [ ] Run `grasp export`, `grasp export --anki`, and `grasp export --raw`. Confirm each prints the full path of a new CSV under `~/.grasp/exports/`, and that running the same command twice produces two different files (timestamped), not one overwritten file.
+- [ ] Open each CSV in a spreadsheet app (or `python3 -c "import csv; print(list(csv.reader(open('<path>'))))"`). Confirm it parses cleanly — especially any row whose question/answer text has a comma, quote, or line break in it.
+- [ ] Confirm `grasp export --anki`'s output message specifically mentions importing into Anki; confirm the default and `--raw` exports don't (just a location confirmation).
 
 ## 7. What happens when things go wrong
 

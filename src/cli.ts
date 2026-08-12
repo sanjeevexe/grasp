@@ -19,6 +19,9 @@ import {
 } from "./store";
 import { runInit } from "./init";
 import { runReview } from "./review";
+import { runSetMode, runSetGate, runSetQuestionsCap } from "./set";
+import { runResetConfig, runResetHistory } from "./reset";
+import { ExportShape, printExportResult, runExportToFile } from "./export";
 
 function readPackageVersion(): string {
   const pkgPath = path.join(__dirname, "..", "package.json");
@@ -34,6 +37,14 @@ Usage:
   grasp init                     Install Grasp's Claude Code hooks into this repo (asks for confirmation)
   grasp review                   Work through pending comprehension questions for this repo, interactively
   grasp review --all             Same, but across every repo Grasp has ever touched
+  grasp set mode --easy|--medium|--hard [--global]  Set concept-selection difficulty preference (repo-local, or --global)
+  grasp set gate soft|hard [--global]               Set gateMode (repo-local, or --global)
+  grasp set questions-cap <n> [--global]            Set questionsPerSessionCap (repo-local, or --global)
+  grasp reset config [--global]  Reset config to defaults (deletes .grasp.json locally, or overwrites the global file)
+  grasp reset history [--yes]    Irreversibly wipe all stored question/answer history (asks to confirm unless --yes)
+  grasp export                   Export your Q&A history to CSV, for your own spreadsheet review
+  grasp export --anki            Export concept questions as an Anki-importable Front/Back/Tags CSV
+  grasp export --raw             Export every column of every events row, unfiltered
   grasp debug:seed               (dev) Insert one fake event + concept tag, for verifying the local store
   grasp debug:capture <repo>     (dev) Run git-diff capture against <repo> and print the resulting diff object
   grasp debug:answer <event-id>  (dev) Simulate answering an event's concept question (marks its concept tag(s) answered)
@@ -429,6 +440,67 @@ async function main(): Promise<void> {
     // entry) — a single boolean flag doesn't justify pulling one in.
     const all = args.slice(1).includes("--all");
     await runReview({ all });
+    return;
+  }
+
+  if (command === "set") {
+    // Same repo-root resolution every other repo-scoped command uses —
+    // `grasp set ...` (no --global) writes to the actual repo root's
+    // .grasp.json, not wherever the command happened to be invoked from.
+    const repoRoot = resolveRepoRoot(process.cwd());
+    const subcommand = args[1];
+    const rest = args.slice(2);
+    if (subcommand === "mode") {
+      runSetMode(rest, { repoRoot });
+      return;
+    }
+    if (subcommand === "gate") {
+      runSetGate(rest, { repoRoot });
+      return;
+    }
+    if (subcommand === "questions-cap") {
+      runSetQuestionsCap(rest, { repoRoot });
+      return;
+    }
+    process.stderr.write("Usage: grasp set mode|gate|questions-cap ...\n");
+    process.exitCode = 1;
+    return;
+  }
+
+  if (command === "reset") {
+    const repoRoot = resolveRepoRoot(process.cwd());
+    const subcommand = args[1];
+    const rest = args.slice(2);
+    if (subcommand === "config") {
+      runResetConfig(rest, { repoRoot });
+      return;
+    }
+    if (subcommand === "history") {
+      await runResetHistory(rest, { openDb: () => openStore() });
+      return;
+    }
+    process.stderr.write("Usage: grasp reset config|history ...\n");
+    process.exitCode = 1;
+    return;
+  }
+
+  if (command === "export") {
+    const rest = args.slice(1);
+    const wantsAnki = rest.includes("--anki");
+    const wantsRaw = rest.includes("--raw");
+    if (wantsAnki && wantsRaw) {
+      process.stderr.write("Usage: grasp export [--anki | --raw] (pick at most one)\n");
+      process.exitCode = 1;
+      return;
+    }
+    const shape: ExportShape = wantsAnki ? "anki" : wantsRaw ? "raw" : "default";
+    const db = openStore();
+    try {
+      const result = runExportToFile(db, shape);
+      printExportResult(result);
+    } finally {
+      db.close();
+    }
     return;
   }
 

@@ -2,6 +2,8 @@ import { DiffFile } from "./adapters/agentAdapter";
 
 export type GateMode = "soft" | "hard";
 
+export type DifficultyMode = "easy" | "medium" | "hard";
+
 export interface DiffThresholds {
   minChangedLines: number;
   maxTotalChangedLines: number;
@@ -14,6 +16,15 @@ export interface GraspConfig {
   ignorePatterns: string[];
   questionsPerSessionCap: number;
   diffThresholds: DiffThresholds;
+  /**
+   * Soft preference for which concept the judge picks when a diff offers
+   * more than one reasonable candidate — NOT a knob on how deeply/rigorously
+   * a chosen concept's question is written (see FUTURE_IDEAS.md item 2 for
+   * that deliberately-rejected idea, and DECISIONS.md's "difficultyMode
+   * scope" entry). `"medium"` leaves the judge prompt's existing, already-
+   * shipped behavior completely unchanged.
+   */
+  difficultyMode: DifficultyMode;
 }
 
 export interface EventRecord {

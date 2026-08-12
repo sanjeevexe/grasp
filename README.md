@@ -62,6 +62,47 @@ This opens an interactive terminal view of every question you haven't answered o
 
 After you submit a real answer, Grasp shows a sample answer for that question before moving on — for your own comparison, never a grade or a correctness check (see [Status and limitations](#status-and-limitations)). If you're stuck, press Escape instead of typing: Grasp shows a short explanation of the underlying concept, then gives you one retry at the same question. From there, either type a real answer (recorded normally, sample answer shown, same as above) or press Escape again to genuinely decline — that's still a real keypress, never silent or automatic, and you'll still see the sample answer before moving on even if you declined. If several questions piled up from one long session, they're grouped so you work through one session's worth before moving to the next, with a running count so you can see how much is left.
 
+## Commands
+
+Day-to-day settings that used to require hand-editing `.grasp.json`/`~/.grasp/config.json` now have dedicated commands. All of them are hand-rolled argument parsing (no CLI framework) — same style as `grasp review --all` — and, like `.grasp.json` itself, default to the current repo unless you pass `--global`.
+
+- **`grasp set mode --easy|--medium|--hard [--global]`** — sets `difficultyMode`, a soft preference for which concept Grasp picks when a diff offers more than one reasonable candidate to ask about. It never changes how deeply a chosen concept's own question is written — see [Configuration](#configuration).
+- **`grasp set gate soft|hard [--global]`** — sets `gateMode` (see [Gate modes](#gate-modes)). Replaces hand-editing the config file for this one setting.
+- **`grasp set questions-cap <n> [--global]`** — sets `questionsPerSessionCap` (a positive integer). This is the cap for live, hook-driven Claude Code sessions specifically — unrelated to any cap a future `grasp scan` command may introduce for scan runs.
+- **`grasp reset config [--global]`** — resets settings back to defaults. `--global` overwrites `~/.grasp/config.json` with the built-in defaults. Without `--global`, it deletes the repo's `.grasp.json` if present (so the repo falls back fully to global config, same as a repo that never had an override) — it does not leave behind an empty override file.
+- **`grasp reset history [--yes]`** — **irreversibly** wipes all stored question/answer history (both the `events` and `concept_tags` tables). Asks for interactive `y/N` confirmation by default; pass `--yes` to skip the prompt for scripting.
+- **`grasp export` / `grasp export --anki` / `grasp export --raw`** — exports everything currently in your local history to a CSV file under `~/.grasp/exports/` (timestamped, so repeated runs never overwrite each other). See [Exporting your data](#exporting-your-data) below for what each shape contains.
+
+All three read-modify-write config commands (`set mode`/`set gate`/`set questions-cap`) preserve any other keys already in the target file — setting one field never clobbers something you hand-edited into the same file.
+
+Two config fields remain hand-edit-only, with no dedicated command: **`ignorePatterns`** and **`diffThresholds`**. Both take open-ended, multi-value or structured input (a list of arbitrary path patterns; three separate numeric thresholds) that doesn't reduce cleanly to a single flag the way a `soft`/`hard` enum or a single integer does — edit `.grasp.json`/`~/.grasp/config.json` directly for these, as described in [Configuration](#configuration).
+
+## Exporting your data
+
+`grasp export` writes a CSV of everything in your local `events` table to `~/.grasp/exports/`, in one of three shapes:
+
+- **`grasp export` (default)** — one row per real question (not miss rows): concept tag(s), the concept and instance question text, your own concept and instance answers, the sample answers for both (for side-by-side comparison), timestamp, and repo. A skipped phase's answer column shows `(skipped)` rather than omitting the row — a skipped question is still meaningful information about what you never got around to.
+- **`grasp export --anki`** — a `Front,Back,Tags` CSV shaped for Anki's plain CSV import (File > Import in Anki). Front is the concept question, Back is its sample answer, Tags is the concept tag(s) (space-separated, Anki's own convention). Every concept-question occurrence is included, answered or skipped, with no deduplication by tag — asking about the same tag twice produces two cards on purpose.
+- **`grasp export --raw`** — every column of every row in `events`, completely unfiltered — the escape hatch if you want everything, uncurated.
+
+None of the three shapes filter or label rows by source (diff-triggered vs. scan-triggered) — that distinction doesn't exist in the schema yet. Fields with embedded commas, quotes, or newlines (question/answer text routinely has all three) are quoted per standard CSV rules, so the files open cleanly in Excel/Numbers/Google Sheets as well as importing into Anki.
+
+## Inspecting your history directly
+
+Everything lives in a plain, uncompressed SQLite database at `~/.grasp/history.db` — `grasp export` is a convenience, not the only way to look at your data. A couple of starting points with the `sqlite3` CLI:
+
+```bash
+# Every question you've ever been asked, most recent first
+sqlite3 ~/.grasp/history.db \
+  "SELECT timestamp, repo, question_concept, question_instance FROM events WHERE question_type IS NOT NULL ORDER BY timestamp DESC LIMIT 20;"
+
+# Which concept tags you've answered the most (a rough "what you already know well" list)
+sqlite3 ~/.grasp/history.db \
+  "SELECT tag, COUNT(*) AS times_asked, SUM(answered) AS times_answered FROM concept_tags GROUP BY tag ORDER BY times_asked DESC;"
+```
+
+`sqlite3 ~/.grasp/history.db ".schema"` prints the full table layout if you want to write your own queries beyond these.
+
 ## What gets sent where, and what it costs
 
 Grasp reads your code and sends diffs to an LLM to generate questions. That's worth being direct about:
@@ -73,7 +114,7 @@ Grasp reads your code and sends diffs to an LLM to generate questions. That's wo
 
 ## Configuration
 
-Grasp reads a global config at `~/.grasp/config.json` (created with defaults on first run), optionally overridden per-repo by a `.grasp.json` file in that repo's root. Repo-level values win on conflict; only the keys you actually set need to appear in `.grasp.json`. Both files are plain, strict JSON — no comments, no trailing commas; the example below is meant to be copied and have values changed, not copied verbatim with the annotations still in it.
+Grasp reads a global config at `~/.grasp/config.json` (created with defaults on first run), optionally overridden per-repo by a `.grasp.json` file in that repo's root. Repo-level values win on conflict; only the keys you actually set need to appear in `.grasp.json`. Both files are plain, strict JSON — no comments, no trailing commas; the example below is meant to be copied and have values changed, not copied verbatim with the annotations still in it. `gateMode`, `questionsPerSessionCap`, and `difficultyMode` can also be set with a dedicated command instead of hand-editing either file — see [Commands](#commands).
 
 ```json
 {
@@ -85,16 +126,18 @@ Grasp reads a global config at `~/.grasp/config.json` (created with defaults on 
     "minChangedLines": 3,
     "maxTotalChangedLines": 1500,
     "maxSingleFileChangedLines": 800
-  }
+  },
+  "difficultyMode": "medium"
 }
 ```
 
-- **`gateMode`** — `"soft"` (nudge only) or `"hard"` (blocks the next tool call until you engage). See [Gate modes](#gate-modes).
-- **`costCapUsd`** — stop generating for a session once cumulative spend hits this.
-- **`ignorePatterns`** — extra paths/filenames to never generate questions about, beyond the built-in list. **Matching is plain, not glob**: a pattern ending in `/` matches that name as a directory segment anywhere in the path (e.g. `"scripts/"` matches `scripts/build.sh` and `packages/a/scripts/x.js`); any other pattern matches an exact basename or an exact full relative path (e.g. `"generated.ts"` matches both `generated.ts` and `src/generated.ts`, but not `generated.test.ts`). Wildcards like `*` or `**` are **not** supported and are matched literally, so `"generated/**"` will silently match nothing — use `"generated/"` instead.
-- **`questionsPerSessionCap`** — stop generating once a session has produced this many real question **events**. This counts `events` rows, not individual displayed questions: a "both" event (concept + instance) is one toward this cap but shows as two questions in `grasp review`, so a cap of 8 can still leave you with up to 16 questions to actually answer.
+- **`gateMode`** — `"soft"` (nudge only) or `"hard"` (blocks the next tool call until you engage). See [Gate modes](#gate-modes). Dedicated command: `grasp set gate soft|hard [--global]`.
+- **`costCapUsd`** — stop generating for a session once cumulative spend hits this. Hand-edit only.
+- **`ignorePatterns`** — extra paths/filenames to never generate questions about, beyond the built-in list. **Matching is plain, not glob**: a pattern ending in `/` matches that name as a directory segment anywhere in the path (e.g. `"scripts/"` matches `scripts/build.sh` and `packages/a/scripts/x.js`); any other pattern matches an exact basename or an exact full relative path (e.g. `"generated.ts"` matches both `generated.ts` and `src/generated.ts`, but not `generated.test.ts`). Wildcards like `*` or `**` are **not** supported and are matched literally, so `"generated/**"` will silently match nothing — use `"generated/"` instead. Hand-edit only — an open-ended list of patterns doesn't reduce cleanly to a single flag.
+- **`questionsPerSessionCap`** — stop generating once a session has produced this many real question **events**. This counts `events` rows, not individual displayed questions: a "both" event (concept + instance) is one toward this cap but shows as two questions in `grasp review`, so a cap of 8 can still leave you with up to 16 questions to actually answer. Dedicated command: `grasp set questions-cap <n> [--global]`. (This is unrelated to any cap a future `grasp scan` command may introduce for scan runs.)
 - **`diffThresholds.minChangedLines`** — diffs smaller than this (in every file) are too trivial to ask about.
-- **`diffThresholds.maxTotalChangedLines`** / **`maxSingleFileChangedLines`** — diffs bigger than this are skipped rather than crammed into one question.
+- **`diffThresholds.maxTotalChangedLines`** / **`maxSingleFileChangedLines`** — diffs bigger than this are skipped rather than crammed into one question. `diffThresholds` as a whole is hand-edit only — three related numeric thresholds don't reduce cleanly to a single flag.
+- **`difficultyMode`** — `"easy"`, `"medium"` (default), or `"hard"`. A soft preference for which concept Grasp's judge picks when a diff genuinely offers more than one reasonable candidate to ask about — it never changes how deeply or rigorously a chosen concept's own question is written, and it never prevents a question from being generated (the judge can still pick whichever concept the diff actually offers if there's only one reasonable option). `"medium"` leaves generation behavior completely unchanged from Grasp's original default. Dedicated command: `grasp set mode --easy|--medium|--hard [--global]`.
 
 A built-in baseline (lockfiles, `node_modules/`, `dist/`, `build/`, `.git/`, and Grasp's own `.grasp.json`/`.claude/settings.local.json`) is always excluded regardless of what you configure — `ignorePatterns` is for adding to that list, not replacing it.
 
