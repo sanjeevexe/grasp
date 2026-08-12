@@ -426,7 +426,18 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
 
     const isAnsweringPhase = phase === "concept" || phase === "instance";
     const showBlankWarning = isAnsweringPhase && blankSubmitAttempted && inputValue.trim().length === 0;
-    const escHint = hasExplanation ? "[Esc] stuck? see explanation" : "[Esc] skip";
+    // The retry-offered flag differs by active phase — see conceptRetryOffered/
+    // instanceRetryOffered above. Once the active phase's retry has already been
+    // offered, this Escape press is the terminal decline, not another trip to the
+    // explain screen, so the hint needs to say "skip" again rather than repeating
+    // the "see explanation" wording from the first attempt.
+    const computeEscHint = () => {
+      if (!hasExplanation) return "[Esc] skip";
+      const retryOffered = phase === "concept" ? conceptRetryOffered : instanceRetryOffered;
+      return retryOffered ? "[Esc] skip" : "[Esc] stuck? see explanation";
+    };
+    const escHint = computeEscHint();
+    const showScrollHint = lines.length > maxDiffRows;
 
     return (
       <Box flexDirection="column">
@@ -448,7 +459,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
             <Text>{event.conceptExplanation}</Text>
             <Box marginTop={1}>
               <Text dimColor>
-                Press any key to try again — you get one more shot at this question.   (terminal: {columns}x{rows})
+                Press any key to try again.   (terminal: {columns}x{rows})
               </Text>
             </Box>
           </Box>
@@ -478,11 +489,25 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
               </Text>
             ) : (
               <Text dimColor>
-                [Enter] submit   [↑/↓] scroll diff   {escHint}   (terminal: {columns}x{rows})
+                [Enter] submit   {showScrollHint ? "[↑/↓] scroll diff   " : ""}
+                {escHint}   [Ctrl+C] quit anytime   (terminal: {columns}x{rows})
               </Text>
             )}
           </Box>
         )}
+      </Box>
+    );
+  }
+
+  function StartBanner({ items }: { items: ReviewQueueItem[] }) {
+    const sessionCount = new Set(items.map((item) => item.event.sessionId ?? item.batchIndex)).size;
+    return (
+      <Box marginBottom={1} flexDirection="column">
+        <Text bold>
+          {items.length} question{items.length === 1 ? "" : "s"} pending
+          {sessionCount > 1 ? ` across ${sessionCount} sessions` : ""}.
+        </Text>
+        <Text dimColor>Ctrl+C is always safe — anything unanswered just stays pending.</Text>
       </Box>
     );
   }
@@ -523,6 +548,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     const showSessionContext = current.event.sessionId !== null && (current.sessionSize > 1 || current.batchCount > 1);
     return (
       <Box flexDirection="column">
+        {index === 0 ? <StartBanner items={items} /> : null}
         <Text dimColor>
           {index + 1} of {items.length} pending
           {showSessionContext
