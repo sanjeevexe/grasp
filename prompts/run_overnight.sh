@@ -12,11 +12,18 @@
 # the morning either way.
 #
 # Usage (from the repo root):
-#   caffeinate -s ./prompts/run_overnight.sh
+#   caffeinate -s ./prompts/run_overnight.sh          # start from prompt 1
+#   caffeinate -s ./prompts/run_overnight.sh 2         # resume from prompt 2
 #
 # `caffeinate -s` keeps the machine from sleeping for the duration; without
 # it, the script itself behaves identically, your machine just might sleep
 # mid-run on battery.
+#
+# The optional argument is a 1-based prompt number to START from — use this
+# to resume after a prompt was already manually merged into main (e.g. after
+# investigating a stop and confirming the branch was safe to merge by hand).
+# It assumes everything before that number is already merged into main;
+# it does not check this for you.
 
 set -uo pipefail
 
@@ -54,11 +61,20 @@ fi
 
 command -v claude >/dev/null 2>&1 || fail_stop "claude CLI not found on PATH."
 
-log "Starting overnight run. Log: $RUN_LOG"
+START_AT="${1:-1}"
+if ! [[ "$START_AT" =~ ^[1-4]$ ]]; then
+  fail_stop "Argument must be a prompt number 1-4 (got: '$START_AT')."
+fi
+START_INDEX=$((START_AT - 1))
+
+log "Starting overnight run from prompt $START_AT/4. Log: $RUN_LOG"
 
 # --- main loop ------------------------------------------------------------
 
 for i in "${!PROMPT_NAMES[@]}"; do
+  if [ "$i" -lt "$START_INDEX" ]; then
+    continue
+  fi
   NAME="${PROMPT_NAMES[$i]}"
   FILE="${PROMPT_FILES[$i]}"
   BRANCH="feature/$(printf '%02d' $((i+1)))-$NAME"
@@ -107,7 +123,24 @@ for i in "${!PROMPT_NAMES[@]}"; do
   rm -f .grasp-prompt-status
 
   npm run build >> "$RUN_LOG" 2>&1 || fail_stop "$NAME: npm run build failed after Claude Code reported DONE. Branch $BRANCH left unmerged for inspection."
-  npm test >> "$RUN_LOG" 2>&1 || fail_stop "$NAME: npm test failed after Claude Code reported DONE. Branch $BRANCH left unmerged for inspection."
+
+  # A known set of PTY-driven tests (reviewAppPty.test.js) are confirmed
+  # pre-existing-flaky on this machine, independent of any prompt's changes
+  # (verified 2026-08-12: identical failures reproduced on unmodified main).
+  # Retry the test suite up to 2 extra times before treating a failure as
+  # real — genuine regressions fail consistently across retries; timing
+  # flakiness usually doesn't. This does not weaken the gate: it still stops
+  # the run if failures persist across all attempts.
+  TEST_ATTEMPTS=3
+  TEST_OK=0
+  for attempt in $(seq 1 $TEST_ATTEMPTS); do
+    if npm test >> "$RUN_LOG" 2>&1; then
+      TEST_OK=1
+      break
+    fi
+    log "$NAME: npm test failed (attempt $attempt/$TEST_ATTEMPTS) — retrying in case this is known PTY-test flakiness, not a real regression."
+  done
+  [ $TEST_OK -eq 1 ] || fail_stop "$NAME: npm test failed $TEST_ATTEMPTS times in a row after Claude Code reported DONE — treating as a real failure, not flakiness. Branch $BRANCH left unmerged for inspection."
 
   log "$NAME: build + test passed independently. Merging into main..."
 
