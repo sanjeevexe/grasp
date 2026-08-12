@@ -4,7 +4,6 @@ import { AgentAdapter, CapturedDiff } from "./agentAdapter";
 import { isMissingGitObjectError } from "../git";
 import { loadConfig } from "../config";
 import { evaluateCapturedDiff, FilterResult } from "../filter";
-import { runGeneration } from "../generation";
 import { GraspConfig } from "../types";
 import {
   completeTurn,
@@ -99,15 +98,28 @@ export class ClaudeCodeAdapter implements AgentAdapter {
    * real bugs found by an independent test pass: (1) overlapping hook
    * processes (e.g. several `PostToolUse` firings for near-simultaneous
    * tool calls) used to each read the same stale checkpoint before any of
-   * them advanced it, so all of them captured and paid to generate a
-   * question about the identical diff; (2) a config error thrown while
-   * loading/filtering used to surface *after* the checkpoint had already
-   * been advanced (and, being thrown from an un-awaited async call, as an
-   * unhandled rejection that could kill the hook process outright), so the
-   * diff that triggered it was silently lost forever. Now the checkpoint
-   * only advances if the capture was durably recorded — an error rolls the
-   * whole transaction back, leaving the checkpoint exactly where it was so
-   * the same diff is retried on the next firing.
+   * them advanced it, so all of them captured the identical diff; (2) a
+   * config error thrown while loading/filtering used to surface *after*
+   * the checkpoint had already been advanced (and, being thrown from an
+   * un-awaited async call, as an unhandled rejection that could kill the
+   * hook process outright), so the diff that triggered it was silently
+   * lost forever. Now the checkpoint only advances if the capture was
+   * durably recorded — an error rolls the whole transaction back, leaving
+   * the checkpoint exactly where it was so the same diff is retried on the
+   * next firing.
+   *
+   * As of the reliability rework (see DECISIONS.md's "Batched-at-Stop
+   * generation" entry), this method ONLY captures — it no longer calls
+   * `runGeneration` itself. `PostToolUse` fires once per tool call, and a
+   * single Claude Code turn routinely makes several tool calls in quick
+   * succession; generating immediately here meant every one of those calls
+   * competed for the same one-at-a-time per-session generation slot on a
+   * hard clock it didn't control, and a call queued behind an earlier one
+   * could run out of runway and time out through no fault of its own.
+   * Generation now happens once per `Stop` firing (once per turn, not once
+   * per tool call), covering everything captured-but-unresolved for this
+   * (session, repo) in one batched attempt — see `runBatchGeneration` in
+   * generation.ts and its call site in cli.ts's `runInternalHook`.
    *
    * `ensureCheckpointSeeded()` is expected to have already run earlier in
    * this same hook invocation (see cli.ts's `runInternalHook`), so a
@@ -120,22 +132,6 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
     if (!claim.claimed) {
       return emptyCapturedDiff(this.repoPath);
-    }
-
-    // Generation (a slow `claude -p` subprocess call, up to
-    // GENERATION_TIMEOUT_MS) deliberately runs OUTSIDE the transaction
-    // above — holding SQLite's write lock for that long would stall every
-    // other concurrent hook firing (including unrelated repos/sessions)
-    // until it finished. The capture itself is already durably recorded by
-    // this point regardless of what happens next.
-    if (claim.verdict.passed) {
-      runGeneration(this.db, {
-        sessionId: this.sessionId,
-        repo: claim.diff.repo,
-        significantFiles: claim.verdict.significantFiles,
-        config: claim.config,
-        diffHash: claim.diff.diffHash,
-      });
     }
 
     return claim.diff;
@@ -215,6 +211,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
         diff,
         filtered: !verdict.passed,
         filterReason: verdict.reason,
+        // Persisted now (not recomputed later) so the eventual batched-at-
+        // Stop generation attempt uses exactly what the filter saw at
+        // capture time — see store.ts's captured_diffs schema comment.
+        significantFiles: verdict.passed ? verdict.significantFiles : null,
       });
 
       // Advance the checkpoint LAST, only once the capture is durably
@@ -263,7 +263,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
    * internally, for any future caller that already has a diff in hand and
    * isn't going through the checkpoint-claim path itself (nothing in this
    * codebase currently calls this directly; `checkAndCapture` is
-   * self-contained precisely so it doesn't need to).
+   * self-contained precisely so it doesn't need to). Capture-only, matching
+   * `checkAndCapture` — see that method's doc comment for why generation no
+   * longer happens here either: it's batched at `Stop` via
+   * `runBatchGeneration`, not triggered per capture.
    */
   async onChangeDetected(diff: CapturedDiff): Promise<void> {
     const { config } = loadConfig(this.repoPath);
@@ -277,17 +280,8 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       diff,
       filtered: !verdict.passed,
       filterReason: verdict.reason,
+      significantFiles: verdict.passed ? verdict.significantFiles : null,
     });
-
-    if (verdict.passed) {
-      runGeneration(this.db, {
-        sessionId: this.sessionId,
-        repo: diff.repo,
-        significantFiles: verdict.significantFiles,
-        config,
-        diffHash: diff.diffHash,
-      });
-    }
   }
 
   /**

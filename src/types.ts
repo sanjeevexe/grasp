@@ -12,7 +12,6 @@ export interface DiffThresholds {
 
 export interface GraspConfig {
   gateMode: GateMode;
-  costCapUsd: number;
   ignorePatterns: string[];
   questionsPerSessionCap: number;
   diffThresholds: DiffThresholds;
@@ -51,12 +50,13 @@ export interface EventRecord {
    * failure/timeout with no recoverable envelope, or a well-formed
    * response missing `total_cost_usd`) — distinct from `costUsd === null`
    * on a `cap_reached`/slot-wait-timeout row, where no call was ever
-   * attempted at all and there's nothing unknown about it. Drives the
-   * "stop generating for this session once its budget is unknowable"
-   * safety rail — see `hasUnknownCostFailure` (store.ts) and
-   * DECISIONS.md's "Unknown-cost failures halt further generation for the
-   * session" entry. Optional/defaults to false so existing call sites
-   * (cli.ts debug:answer, tests) that never set it don't need updating.
+   * attempted at all and there's nothing unknown about it. Purely
+   * informational/audit metadata now — it used to also drive a "stop
+   * generating for this session once its budget is unknowable" safety rail,
+   * removed along with the dollar-cost cap itself (see DECISIONS.md's
+   * "Remove costCapUsd and the unknown-cost-halt mechanism" entry).
+   * Optional/defaults to false so existing call sites (cli.ts debug:answer,
+   * tests) that never set it don't need updating.
    */
   costUnknown?: boolean;
   /**

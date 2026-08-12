@@ -5,7 +5,6 @@ import { GraspConfig } from "./types";
 
 export const DEFAULT_CONFIG: GraspConfig = {
   gateMode: "soft",
-  costCapUsd: 0.25,
   ignorePatterns: [],
   questionsPerSessionCap: 8,
   diffThresholds: {
@@ -68,12 +67,29 @@ const DIFFICULTY_MODES = ["easy", "medium", "hard"] as const;
 
 const KNOWN_TOP_LEVEL_KEYS = [
   "gateMode",
-  "costCapUsd",
   "ignorePatterns",
   "questionsPerSessionCap",
   "diffThresholds",
   "difficultyMode",
 ] as const;
+
+/**
+ * `costCapUsd` was removed (see DECISIONS.md's "Remove costCapUsd and the
+ * unknown-cost-halt mechanism" entry): a single timed-out generation call
+ * used to permanently and silently halt all further generation for that
+ * session the moment its true cost became unknowable, indistinguishably
+ * from a real cap hit. Generation is now batched-at-Stop with retry instead
+ * (see the same entry), which removes the multi-call queuing that caused
+ * the timeout in the first place — `questionsPerSessionCap` is the sole
+ * remaining safety rail. An old config file with this key would otherwise
+ * just fail the generic "unknown config key" check below, which is correct
+ * but unhelpfully vague for a key that used to be real and meaningful — this
+ * gets its own message instead.
+ */
+const REMOVED_TOP_LEVEL_KEYS: Record<string, string> = {
+  costCapUsd:
+    "costCapUsd was removed — Grasp no longer enforces a dollar-cost cap on generation (see README.md/DECISIONS.md). questionsPerSessionCap is now the sole generation safety rail. Delete this key from your config file.",
+};
 
 const KNOWN_DIFF_THRESHOLD_KEYS = [
   "minChangedLines",
@@ -118,6 +134,10 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
   // function, rather than merely warned about. See DECISIONS.md's "Unknown
   // config keys are rejected, not silently ignored" entry.
   for (const key of Object.keys(value)) {
+    if (key in REMOVED_TOP_LEVEL_KEYS) {
+      errors.push(REMOVED_TOP_LEVEL_KEYS[key]);
+      continue;
+    }
     if (!(KNOWN_TOP_LEVEL_KEYS as readonly string[]).includes(key)) {
       errors.push(
         `unknown config key ${JSON.stringify(key)} (did you mean one of: ${KNOWN_TOP_LEVEL_KEYS.join(", ")}?)`
@@ -127,12 +147,6 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
 
   if (value.gateMode !== undefined && !GATE_MODES.includes(value.gateMode as any)) {
     errors.push(`gateMode must be one of ${GATE_MODES.map((m) => `"${m}"`).join(" | ")}, got ${JSON.stringify(value.gateMode)}`);
-  }
-
-  if (value.costCapUsd !== undefined) {
-    if (typeof value.costCapUsd !== "number" || !Number.isFinite(value.costCapUsd) || value.costCapUsd < 0) {
-      errors.push(`costCapUsd must be a non-negative number, got ${JSON.stringify(value.costCapUsd)}`);
-    }
   }
 
   if (value.ignorePatterns !== undefined) {

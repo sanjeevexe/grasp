@@ -52,7 +52,7 @@ test("ensureGlobalConfigFile: never overwrites an existing file, even a customiz
   const config = ensureGlobalConfigFile(globalConfigPath, graspHome);
   assert.equal(config.gateMode, "hard");
   // Everything NOT overridden still comes from defaults via deepMerge.
-  assert.equal(config.costCapUsd, DEFAULT_CONFIG.costCapUsd);
+  assert.equal(config.questionsPerSessionCap, DEFAULT_CONFIG.questionsPerSessionCap);
 });
 
 test("ensureGlobalConfigFile: throws a clear error on malformed JSON, never silently regenerates", () => {
@@ -73,7 +73,7 @@ test("loadConfig: repo-level .grasp.json values win over global on conflict", ()
   assert.equal(loaded.config.gateMode, "hard");
   assert.equal(loaded.config.questionsPerSessionCap, 2);
   // Untouched settings still come from the (default) global config.
-  assert.equal(loaded.config.costCapUsd, DEFAULT_CONFIG.costCapUsd);
+  assert.deepEqual(loaded.config.ignorePatterns, DEFAULT_CONFIG.ignorePatterns);
   assert.equal(loaded.repoConfigPath, path.join(repoRoot, ".grasp.json"));
 });
 
@@ -132,11 +132,21 @@ test("loadConfig: rejects an invalid gateMode value instead of silently treating
   assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /gateMode must be one of/);
 });
 
-test("loadConfig: rejects a negative costCapUsd", () => {
+// Regression coverage for the reliability rework's removal of the
+// dollar-cost cap (see DECISIONS.md's "Remove costCapUsd and the
+// unknown-cost-halt mechanism" entry): an old config file with this key
+// left over from before the removal must fail with a message that says
+// what changed, not just a generic "unknown config key" — someone upgrading
+// shouldn't have to guess why a key that used to work no longer does.
+
+test("loadConfig: rejects a costCapUsd key with a specific removal message, not just 'unknown key'", () => {
   const graspHome = mkTempDir("grasp-test-home-");
   const globalConfigPath = path.join(graspHome, "config.json");
-  const repoRoot = repoWithConfig(JSON.stringify({ costCapUsd: -1 }));
-  assert.throws(() => loadConfig(repoRoot, globalConfigPath, graspHome), /costCapUsd must be a non-negative number/);
+  const repoRoot = repoWithConfig(JSON.stringify({ costCapUsd: 0.25 }));
+  assert.throws(
+    () => loadConfig(repoRoot, globalConfigPath, graspHome),
+    /costCapUsd was removed — Grasp no longer enforces a dollar-cost cap/
+  );
 });
 
 test("loadConfig: rejects a non-integer questionsPerSessionCap", () => {
@@ -181,7 +191,6 @@ test("loadConfig: a fully valid override with every key set still passes", () =>
   const repoRoot = repoWithConfig(
     JSON.stringify({
       gateMode: "hard",
-      costCapUsd: 0.5,
       ignorePatterns: ["a/", "b.txt"],
       questionsPerSessionCap: 3,
       diffThresholds: { minChangedLines: 1, maxTotalChangedLines: 100, maxSingleFileChangedLines: 50 },

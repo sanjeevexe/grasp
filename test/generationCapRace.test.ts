@@ -11,12 +11,14 @@ import { openStore } from "../src/store";
  * Regression test for the release-blocking cap-enforcement race an
  * independent test pass reproduced: six overlapping `runGeneration` calls
  * for the SAME session, each backed by a mock `claude` slow enough to keep
- * several calls in flight at once, all read the same pre-call cost/question
- * totals and all invoked Claude — a one-question cap producing six question
- * events, a $0.001 cost cap allowing $0.006 spent. Reproduces the bug shape
- * for real: several separate OS processes racing one shared SQLite store,
- * not a single-process simulation — matching the style already established
- * in test/checkpointRace.test.ts and test/concurrency.test.ts.
+ * several calls in flight at once, all read the same pre-call question
+ * count and all invoked Claude — a one-question cap producing six question
+ * events. Reproduces the bug shape for real: several separate OS processes
+ * racing one shared SQLite store, not a single-process simulation —
+ * matching the style already established in test/checkpointRace.test.ts and
+ * test/concurrency.test.ts. (This test used to also cover a dollar-cost cap
+ * race — that cap was removed in the reliability rework; see DECISIONS.md's
+ * "Remove costCapUsd" entry. questionsPerSessionCap is now the only cap.)
  */
 
 const WORKER_COUNT = 6;
@@ -32,14 +34,13 @@ function runWorker(
   dbPath: string,
   sessionId: string,
   workerId: number,
-  costCapUsd: number,
   questionsPerSessionCap: number,
   env: Record<string, string>
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [FIXTURE_PATH, dbPath, sessionId, String(workerId), String(costCapUsd), String(questionsPerSessionCap)],
+      [FIXTURE_PATH, dbPath, sessionId, String(workerId), String(questionsPerSessionCap)],
       { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } }
     );
     let stdout = "";
@@ -77,7 +78,7 @@ test(
     // that, without serialization, all six would read the same
     // pre-call question count (0) and all decide they're under the cap.
     const results = await Promise.all(
-      Array.from({ length: WORKER_COUNT }, (_, i) => runWorker(dbPath, sessionId, i, 999, 1, env))
+      Array.from({ length: WORKER_COUNT }, (_, i) => runWorker(dbPath, sessionId, i, 1, env))
     );
 
     const failures = results.filter((r) => r.code !== 0);
@@ -103,48 +104,6 @@ test(
       capMisses.n,
       WORKER_COUNT - 1,
       `the remaining ${WORKER_COUNT - 1} callers must all be logged as cap_reached misses, got ${capMisses.n}`
-    );
-  }
-);
-
-test(
-  "runGeneration: overlapping processes for the same session never exceed the cost cap",
-  { timeout: 30_000 },
-  async () => {
-    const dbPath = tempDbPath();
-    openStore(dbPath).close();
-    const sessionId = "cost-cap-race-session";
-
-    const env = {
-      PATH: `${FIXTURE_CLAUDE_DIR}:${process.env.PATH}`,
-      GRASP_TEST_MOCK_MODE: "normal",
-      GRASP_TEST_MOCK_COST: "0.001",
-      GRASP_TEST_MOCK_DELAY_MS: "2000",
-      GRASP_TEST_MOCK_COUNTER: path.join(path.dirname(dbPath), "counter.txt"),
-    };
-
-    // A $0.001 cap with six $0.001-per-call workers racing: without
-    // serialization every one of them reads spentSoFar=0 before any commits
-    // and all six invoke Claude, landing $0.006. With serialization, only
-    // the first caller can ever see spentSoFar (0) below the cap.
-    const results = await Promise.all(
-      Array.from({ length: WORKER_COUNT }, (_, i) => runWorker(dbPath, sessionId, i, 0.001, 999, env))
-    );
-
-    const failures = results.filter((r) => r.code !== 0);
-    if (failures.length > 0) {
-      assert.fail(`${failures.length}/${WORKER_COUNT} worker processes failed:\n` + failures.map((f) => f.stderr.trim()).join("\n"));
-    }
-
-    const db = new Database(dbPath, { readonly: true });
-    const totalCost = db
-      .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS total FROM events WHERE session_id = ?`)
-      .get(sessionId) as { total: number };
-    db.close();
-
-    assert.ok(
-      totalCost.total <= 0.001 + 1e-9,
-      `expected at most one call's worth of spend (~0.001) under a $0.001 cap with ${WORKER_COUNT} overlapping callers, got ${totalCost.total}`
     );
   }
 );

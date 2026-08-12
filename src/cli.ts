@@ -6,6 +6,7 @@ import { GitDiffAdapter } from "./adapters/gitDiffCapture";
 import { loadConfig } from "./config";
 import { resolveRepoRoot } from "./git";
 import { evaluateCapturedDiff } from "./filter";
+import { runBatchGeneration } from "./generation";
 import {
   getBlockingPendingQuestionsForSession,
   getConceptTagsByEventId,
@@ -254,10 +255,23 @@ function pendingQuestionsMessage(count: number): string {
  * this lives on `Stop` (the only channel a hook has to say anything at
  * all) and why 4 decimal places (real per-call costs are sub-cent; 2
  * decimals would round most of them to "$0.00" and hide the exact signal
- * the cap/summary exist to surface).
+ * this exists to surface). Purely informational now that there's no
+ * dollar-cost cap to enforce (see DECISIONS.md's "Remove costCapUsd" entry)
+ * — spend transparency (brief §3.5) is the only remaining reason to show it.
  */
 function costSummaryMessage(costUsd: number): string {
   return `$${costUsd.toFixed(4)} spent generating comprehension questions this session so far.`;
+}
+
+/**
+ * Now that `cap_reached` can only ever mean the questions-per-session cap
+ * (the dollar-cost cap is gone — see DECISIONS.md's "Remove costCapUsd and
+ * the unknown-cost-halt mechanism" entry), the `Stop` message says so
+ * plainly and points at the actual way out, rather than leaving the user to
+ * infer it from a generic "N questions waiting" nudge.
+ */
+function questionCapMessage(cap: number): string {
+  return `You've hit this session's question cap (${cap}) — start a new Claude Code session, or run \`grasp set questions-cap <n>\` to raise it.`;
 }
 
 /**
@@ -320,22 +334,34 @@ async function runInternalHook(): Promise<void> {
       if (eventName === "PostToolUse") {
         adapter.checkAndCapture();
       } else if (eventName === "Stop") {
+        // Batched-at-Stop generation (see DECISIONS.md's "Batched-at-Stop
+        // generation" entry): gathers everything captured-but-unresolved
+        // for this (session, repo) since the last successful attempt and
+        // runs at most one judge call covering all of it, before the
+        // pending/cost/cap message below is built — so a question this
+        // very attempt just produced (or a cap it just hit) is reflected
+        // in the same message, not one turn late.
+        const { config } = loadConfig(repoRoot);
+        const batchOutcome = runBatchGeneration(db, { sessionId, repo: repoRoot, config });
         await adapter.onSessionComplete();
         // Visibility nudge — applies in BOTH gate modes, since it's the
         // only channel a hook actually has for reaching the user (the
         // narrowly-restricted terminalSequence field aside). See
         // DECISIONS.md's "gate-check scope" entry for why this is
         // session_id-scoped, matching the hard-gate check below. The cost
-        // summary is combined into the same message when both apply — see
-        // DECISIONS.md's "session-end cost summary" entry for why this is
-        // the one place it surfaces and why the two independently-gated
-        // pieces (pending count, spend) combine rather than firing as
+        // summary and question-cap notice are combined into the same
+        // message when they apply — see DECISIONS.md's "session-end cost
+        // summary" entry for why this is the one place it surfaces and why
+        // these independently-gated pieces combine rather than firing as
         // separate messages.
         const pending = getPendingQuestionsForSession(db, sessionId);
         const spentSoFar = getSessionCostUsd(db, sessionId);
         const messageParts: string[] = [];
         if (pending.length > 0) messageParts.push(pendingQuestionsMessage(pending.length));
         if (spentSoFar > 0) messageParts.push(costSummaryMessage(spentSoFar));
+        if (batchOutcome?.missReason === "cap_reached") {
+          messageParts.push(questionCapMessage(config.questionsPerSessionCap));
+        }
         if (messageParts.length > 0) {
           hookOutput = { systemMessage: messageParts.join(" ") };
         }

@@ -69,6 +69,18 @@ const SCHEMA_SQL = `
   -- \`filter_reason\` record Phase 4's mechanical-filter verdict on this
   -- capture — see DECISIONS.md's "Filtered-diff recording" entry: a
   -- filtered-out capture is still recorded here, never silently dropped.
+  -- \`resolved\`/\`significant_files_json\` back the Prompt-3 batched-at-Stop
+  -- generation redesign (see DECISIONS.md's "Batched-at-Stop generation:
+  -- resolved tracking" entry). \`significant_files_json\` is the Phase 4
+  -- filter's \`significantFiles\` verdict for this capture, persisted at
+  -- capture time (not recomputed later — recomputing at Stop time would mean
+  -- re-reading files off disk that may have moved on since, per the
+  -- generated-file-detection 4KB-read check) — non-null exactly when
+  -- \`filtered = 0\`. \`resolved\` starts 0 and is flipped to 1 only once a
+  -- batched generation attempt that covered this row concludes with a real
+  -- outcome (a question, a legitimate "not worth asking", or a genuine
+  -- question-cap hit) — never on a failed/timed-out attempt, so an
+  -- unresolved row is retried by a later batch instead of lost.
   CREATE TABLE IF NOT EXISTS captured_diffs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -78,10 +90,16 @@ const SCHEMA_SQL = `
     diff_json TEXT NOT NULL,
     filtered INTEGER NOT NULL DEFAULT 0,
     filter_reason TEXT,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    significant_files_json TEXT,
     FOREIGN KEY (session_id, prompt_id) REFERENCES cc_turns(session_id, prompt_id)
   );
 
   CREATE INDEX IF NOT EXISTS idx_captured_diffs_turn ON captured_diffs(session_id, prompt_id);
+
+  -- Backs the batched-at-Stop gather query: every unresolved, passed-filter
+  -- capture for a given (session, repo) — see getUnresolvedCapturedDiffs.
+  CREATE INDEX IF NOT EXISTS idx_captured_diffs_pending ON captured_diffs(session_id, repo, filtered, resolved);
 
   -- Append-only audit trail of every hook firing Grasp observed. Exists
   -- because hook stdout isn't surfaced to the user, so this is the only
@@ -141,6 +159,13 @@ function migrateSchema(db: Database.Database): void {
   if (!capturedDiffsColumnNames.has("filter_reason")) {
     db.exec(`ALTER TABLE captured_diffs ADD COLUMN filter_reason TEXT`);
   }
+  if (!capturedDiffsColumnNames.has("resolved")) {
+    db.exec(`ALTER TABLE captured_diffs ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!capturedDiffsColumnNames.has("significant_files_json")) {
+    db.exec(`ALTER TABLE captured_diffs ADD COLUMN significant_files_json TEXT`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_captured_diffs_pending ON captured_diffs(session_id, repo, filtered, resolved)`);
 
   const eventsColumns = db.prepare(`PRAGMA table_info(events)`).all() as Array<{ name: string }>;
   const eventsColumnNames = new Set(eventsColumns.map((c) => c.name));
@@ -612,24 +637,6 @@ export function getSessionCostUsd(db: Database.Database, sessionId: string): num
 }
 
 /**
- * True if this session has already recorded a miss whose real `claude -p`
- * cost genuinely could not be determined (`cost_unknown = 1` — see
- * `EventRecord.costUnknown`'s comment). `getSessionCostUsd` sums NULL as 0,
- * which is correct for rows where no call was ever attempted
- * (`cap_reached`, slot-wait timeout) but would silently let an attempted-
- * but-uncosted call look "free" and leave the session's cap enforcement
- * bypassable by repeating it — this is the separate signal `runGeneration`
- * checks to close that gap. See DECISIONS.md's "Unknown-cost failures halt
- * further generation for the session" entry.
- */
-export function hasUnknownCostFailure(db: Database.Database, sessionId: string): boolean {
-  const row = db
-    .prepare(`SELECT 1 AS found FROM events WHERE session_id = ? AND cost_unknown = 1 LIMIT 1`)
-    .get(sessionId) as { found: number } | undefined;
-  return row !== undefined;
-}
-
-/**
  * Counts real (non-miss) questions — `question_type IS NOT NULL` — for one
  * Claude Code `session_id`, across every turn sharing it. This is the
  * questions-per-session cap's accounting boundary (Phase 8): session-wide,
@@ -754,6 +761,13 @@ export function insertCheckpointTreeIfAbsent(
  * Every capture gets a row here regardless of verdict; nothing is silently
  * dropped (see DECISIONS.md's "Filtered-diff recording" entry).
  * `upsertTurn` must have been called first (FK).
+ *
+ * `significantFiles` is the filter's own verdict for a passed diff (null for
+ * a filtered-out one, which never reaches generation) — persisted verbatim
+ * at capture time so a later batched-at-Stop generation attempt (see
+ * `getUnresolvedCapturedDiffs`) uses exactly what the filter actually saw,
+ * not a re-run against a working tree that may have moved on since. New rows
+ * always start unresolved (`resolved = 0`); see `markCapturedDiffsResolved`.
  */
 export function insertCapturedDiff(
   db: Database.Database,
@@ -763,12 +777,13 @@ export function insertCapturedDiff(
     diff: CapturedDiff;
     filtered: boolean;
     filterReason: string | null;
+    significantFiles: DiffFile[] | null;
   }
 ): number {
   const info = db
     .prepare(
-      `INSERT INTO captured_diffs (session_id, prompt_id, repo, captured_at, diff_json, filtered, filter_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO captured_diffs (session_id, prompt_id, repo, captured_at, diff_json, filtered, filter_reason, significant_files_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       key.sessionId,
@@ -777,7 +792,8 @@ export function insertCapturedDiff(
       key.capturedAt,
       JSON.stringify(key.diff),
       key.filtered ? 1 : 0,
-      key.filterReason
+      key.filterReason,
+      key.significantFiles ? JSON.stringify(key.significantFiles) : null
     );
   return Number(info.lastInsertRowid);
 }
@@ -788,6 +804,20 @@ export interface CapturedDiffRecord {
   diff: CapturedDiff;
   filtered: boolean;
   filterReason: string | null;
+  resolved: boolean;
+  significantFiles: DiffFile[] | null;
+}
+
+function fromCapturedDiffRow(row: any): CapturedDiffRecord {
+  return {
+    id: row.id,
+    capturedAt: row.captured_at,
+    diff: JSON.parse(row.diff_json),
+    filtered: Boolean(row.filtered),
+    filterReason: row.filter_reason,
+    resolved: Boolean(row.resolved),
+    significantFiles: row.significant_files_json ? JSON.parse(row.significant_files_json) : null,
+  };
 }
 
 export function getCapturedDiffsForTurn(
@@ -796,17 +826,47 @@ export function getCapturedDiffsForTurn(
 ): CapturedDiffRecord[] {
   const rows = db
     .prepare(
-      `SELECT id, captured_at, diff_json, filtered, filter_reason FROM captured_diffs
-       WHERE session_id = ? AND prompt_id = ? ORDER BY captured_at ASC`
+      `SELECT * FROM captured_diffs WHERE session_id = ? AND prompt_id = ? ORDER BY captured_at ASC`
     )
     .all(key.sessionId, key.promptId) as any[];
-  return rows.map((row) => ({
-    id: row.id,
-    capturedAt: row.captured_at,
-    diff: JSON.parse(row.diff_json),
-    filtered: Boolean(row.filtered),
-    filterReason: row.filter_reason,
-  }));
+  return rows.map(fromCapturedDiffRow);
+}
+
+/**
+ * Every captured diff for a (session, repo) pair that passed the mechanical
+ * filter (`filtered = 0`) and hasn't yet been resolved by a generation
+ * attempt (`resolved = 0`) — what a `Stop`-triggered batch generation
+ * attempt gathers and covers in one judge call. Scoped to (session, repo),
+ * not session alone — see DECISIONS.md's "Batched-at-Stop generation" entry
+ * for why: a `Stop` firing only ever resolves one repo root (from its own
+ * `cwd`), matching every other per-firing resolution (config, gate-check)
+ * already scoped that way, and it avoids an ill-defined "which repo does
+ * this combined event belong to" for the rare session that touches more
+ * than one repo.
+ */
+export function getUnresolvedCapturedDiffs(
+  db: Database.Database,
+  sessionId: string,
+  repo: string
+): CapturedDiffRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM captured_diffs WHERE session_id = ? AND repo = ? AND filtered = 0 AND resolved = 0 ORDER BY captured_at ASC`
+    )
+    .all(sessionId, repo) as any[];
+  return rows.map(fromCapturedDiffRow);
+}
+
+/**
+ * Marks a set of `captured_diffs` rows resolved — called once a batched
+ * generation attempt that covered them concludes with a real outcome (see
+ * `getUnresolvedCapturedDiffs`'s comment). A no-op on an empty list so
+ * callers don't need to special-case "nothing to mark."
+ */
+export function markCapturedDiffsResolved(db: Database.Database, ids: number[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => "?").join(",");
+  db.prepare(`UPDATE captured_diffs SET resolved = 1 WHERE id IN (${placeholders})`).run(...ids);
 }
 
 /**

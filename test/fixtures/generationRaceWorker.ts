@@ -5,8 +5,11 @@
  * launch several real OS processes calling `runGeneration` for the SAME
  * session concurrently — the actual shape of the cap-enforcement race an
  * independent test pass found (overlapping generation workers all reading
- * the same pre-call cost/question totals before any of them committed a
- * result, so all of them invoked Claude and all of them landed).
+ * the same pre-call question count before any of them committed a result,
+ * so all of them invoked Claude and all of them landed). The dollar-cost
+ * cap this fixture used to also exercise was removed in the reliability
+ * rework (see DECISIONS.md's "Remove costCapUsd" entry) — questionsPerSessionCap
+ * is now the only cap left to race.
  */
 import { openStore } from "../../src/store";
 import { runGeneration } from "../../src/generation";
@@ -16,8 +19,7 @@ import { DiffFile } from "../../src/adapters/agentAdapter";
 const dbPath = process.argv[2];
 const sessionId = process.argv[3];
 const workerId = process.argv[4];
-const costCapUsd = parseFloat(process.argv[5]);
-const questionsPerSessionCap = parseInt(process.argv[6], 10);
+const questionsPerSessionCap = parseInt(process.argv[5], 10);
 
 const significantFiles: DiffFile[] = [
   {
@@ -36,7 +38,7 @@ try {
     sessionId,
     repo: "/tmp/race-repo",
     significantFiles,
-    config: { ...DEFAULT_CONFIG, costCapUsd, questionsPerSessionCap },
+    config: { ...DEFAULT_CONFIG, questionsPerSessionCap },
     diffHash: `race-${workerId}`,
   });
   process.stdout.write(JSON.stringify(outcome) + "\n");
