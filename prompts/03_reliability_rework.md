@@ -7,6 +7,11 @@ only after its own tests pass. Prompts 1 and 2 should already be merged into
 `BUILD_PLAN.md`, and `DECISIONS.md` fresh before starting; they take
 precedence over anything below if they've changed since this was written.
 
+**Work directly on the current branch — do not create, rename, or switch to
+a different git branch yourself.** The branch is already set up for you
+before you start; committing anywhere else breaks the orchestration around
+this run.
+
 **This is the highest-risk prompt of the four** — it changes the core
 generation architecture that's actively relied on for real, current
 dogfooding. Take your time, reason carefully about the existing code before

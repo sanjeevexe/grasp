@@ -7,6 +7,11 @@ only after its own tests pass. Prompts 1–3 should already be merged into
 `BUILD_PLAN.md`, and `DECISIONS.md` fresh before starting; they take
 precedence over anything below if they've changed since this was written.
 
+**Work directly on the current branch — do not create, rename, or switch to
+a different git branch yourself.** The branch is already set up for you
+before you start; committing anywhere else breaks the orchestration around
+this run.
+
 This is a genuinely new feature, not a fix — it extends what Grasp does
 beyond the original brief's scope (the brief is about questions on AI-agent-
 made *changes*; this is about onboarding to existing, unfamiliar code). That
