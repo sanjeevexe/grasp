@@ -74,7 +74,7 @@ export async function runResetHistory(args: string[], deps: ResetHistoryDeps): P
 
     if (!skipConfirm) {
       const confirmed = await askYesNo(
-        `This will permanently delete ${counts.events} event row(s) and ${counts.conceptTags} concept_tags row(s) from your Grasp history. This cannot be undone. Continue? [y/N] `
+        `This will permanently delete ${counts.events} event row(s), ${counts.conceptTags} concept_tags row(s), and ${counts.scanProgress} scan_progress row(s) (grasp scan will start over from the beginning) from your Grasp history. This cannot be undone. Continue? [y/N] `
       );
       if (!confirmed) {
         process.stdout.write("Aborted — no history was deleted.\n");
@@ -84,7 +84,7 @@ export async function runResetHistory(args: string[], deps: ResetHistoryDeps): P
 
     const deleted = clearHistory(db);
     process.stdout.write(
-      `Deleted ${deleted.events} event row(s) and ${deleted.conceptTags} concept_tags row(s). History is now empty.\n`
+      `Deleted ${deleted.events} event row(s), ${deleted.conceptTags} concept_tags row(s), and ${deleted.scanProgress} scan_progress row(s). History is now empty.\n`
     );
   } finally {
     db.close();

@@ -3,7 +3,7 @@ import * as fs from "fs";
 import { randomUUID } from "crypto";
 import { DB_PATH, GRASP_HOME } from "./paths";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
-import { ConceptTagGlobalRow, ConceptTagRecord, EventRecord } from "./types";
+import { ConceptTagGlobalRow, ConceptTagRecord, EventRecord, EventSource } from "./types";
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS events (
@@ -27,7 +27,22 @@ const SCHEMA_SQL = `
     diff_files_json TEXT,
     sample_answer_concept TEXT,
     sample_answer_instance TEXT,
-    concept_explanation TEXT
+    concept_explanation TEXT,
+    -- 'diff' (an AI-agent change) or 'scan' (grasp scan reading existing
+    -- code) — see DECISIONS.md's "grasp scan: storage design" entry. DEFAULT
+    -- backfills every pre-scan row to 'diff' for free on migration. For a
+    -- scan row, diff_summary is repurposed to hold the scanned file's path
+    -- (diff_hash/diff_files_json stay NULL — there's no diff).
+    source TEXT NOT NULL DEFAULT 'diff',
+    -- The §4 cited-excerpt contract for a scan-sourced instance question,
+    -- computed and clamped once at generation time (computeValidatedExcerpt,
+    -- generation.ts) and persisted verbatim — never re-derived from disk
+    -- later, since a scan question can sit pending across multiple separate
+    -- \`grasp scan\` invocations and the file could change in between. All
+    -- three are NULL together whenever there's nothing to show.
+    scan_excerpt_start_line INTEGER,
+    scan_excerpt_end_line INTEGER,
+    scan_excerpt_lines_json TEXT
   );
 
   CREATE TABLE IF NOT EXISTS concept_tags (
@@ -139,6 +154,20 @@ const SCHEMA_SQL = `
     claimed_at TEXT NOT NULL,
     token TEXT NOT NULL
   );
+
+  -- \`grasp scan\`'s file-walk resumability: one row per (repo, file_path)
+  -- Grasp has ever looked at during a scan, permanently — no content hash or
+  -- mtime tracking, so an already-scanned file is never revisited even if
+  -- edited later (that's the diff-capture side's job). A second \`grasp
+  -- scan\` run continues from whatever isn't in this table yet. See
+  -- DECISIONS.md's "grasp scan: file-walk source, ordering, capping, and
+  -- resumability" entry.
+  CREATE TABLE IF NOT EXISTS scan_progress (
+    repo TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    PRIMARY KEY (repo, file_path)
+  );
 `;
 
 /**
@@ -186,6 +215,18 @@ function migrateSchema(db: Database.Database): void {
   }
   if (!eventsColumnNames.has("concept_explanation")) {
     db.exec(`ALTER TABLE events ADD COLUMN concept_explanation TEXT`);
+  }
+  if (!eventsColumnNames.has("source")) {
+    db.exec(`ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'diff'`);
+  }
+  if (!eventsColumnNames.has("scan_excerpt_start_line")) {
+    db.exec(`ALTER TABLE events ADD COLUMN scan_excerpt_start_line INTEGER`);
+  }
+  if (!eventsColumnNames.has("scan_excerpt_end_line")) {
+    db.exec(`ALTER TABLE events ADD COLUMN scan_excerpt_end_line INTEGER`);
+  }
+  if (!eventsColumnNames.has("scan_excerpt_lines_json")) {
+    db.exec(`ALTER TABLE events ADD COLUMN scan_excerpt_lines_json TEXT`);
   }
   // Unconditional (not just inside the branch above): on a fresh install
   // SCHEMA_SQL's CREATE TABLE already includes session_id, so the ALTER
@@ -261,6 +302,10 @@ function toEventRow(event: EventRecord) {
     sampleAnswerConcept: event.sampleAnswerConcept ?? null,
     sampleAnswerInstance: event.sampleAnswerInstance ?? null,
     conceptExplanation: event.conceptExplanation ?? null,
+    source: event.source ?? "diff",
+    scanExcerptStartLine: event.scanExcerptStartLine ?? null,
+    scanExcerptEndLine: event.scanExcerptEndLine ?? null,
+    scanExcerptLinesJson: event.scanExcerptLines ? JSON.stringify(event.scanExcerptLines) : null,
   };
 }
 
@@ -287,6 +332,10 @@ function fromEventRow(row: any): EventRecord {
     sampleAnswerConcept: row.sample_answer_concept,
     sampleAnswerInstance: row.sample_answer_instance,
     conceptExplanation: row.concept_explanation,
+    source: row.source,
+    scanExcerptStartLine: row.scan_excerpt_start_line,
+    scanExcerptEndLine: row.scan_excerpt_end_line,
+    scanExcerptLines: row.scan_excerpt_lines_json ? JSON.parse(row.scan_excerpt_lines_json) : null,
   };
 }
 
@@ -305,13 +354,15 @@ export function insertEvent(
       question_concept, question_instance, question_type, generation_source,
       miss_reason, answer_concept, answer_instance,
       skipped, skip_reason, cost_usd, cost_unknown, diff_files_json,
-      sample_answer_concept, sample_answer_instance, concept_explanation
+      sample_answer_concept, sample_answer_instance, concept_explanation,
+      source, scan_excerpt_start_line, scan_excerpt_end_line, scan_excerpt_lines_json
     ) VALUES (
       @timestamp, @repo, @sessionId, @diffHash, @diffSummary,
       @questionConcept, @questionInstance, @questionType, @generationSource,
       @missReason, @answerConcept, @answerInstance,
       @skipped, @skipReason, @costUsd, @costUnknown, @diffFilesJson,
-      @sampleAnswerConcept, @sampleAnswerInstance, @conceptExplanation
+      @sampleAnswerConcept, @sampleAnswerInstance, @conceptExplanation,
+      @source, @scanExcerptStartLine, @scanExcerptEndLine, @scanExcerptLinesJson
     )
   `);
   const insertTagStmt = db.prepare(
@@ -490,30 +541,42 @@ const PENDING_QUESTION_WHERE = `
 
 /**
  * Every real (non-miss), unanswered, unskipped question, optionally narrowed
- * to one repo. `repoRoot` omitted (or undefined) preserves the original
- * all-repos behavior `grasp review --all` now relies on; passed, it adds a
- * `repo = ?` condition on top of the same `PENDING_QUESTION_WHERE`
- * definition — this does NOT change what counts as "pending" (concept-tag
- * memoization stays global, untouched by this), only which already-pending
- * rows get returned. See DECISIONS.md's "grasp review defaults to the
- * current repo" entry, which supersedes the earlier "query scope: global"
- * entry now that a real dogfooding session showed the global default
- * actively confusing users. `answer_instance IS NULL` alone is a reliable
- * "not yet answered" check: every real question (question_type "both" or
- * "instance") always has a non-null question_instance and gets it answered
- * last in `review`'s concept-then-instance sequence, so it's null iff the
- * event is still pending regardless of question_type.
+ * to one repo and/or one `source`. `repoRoot` omitted (or undefined)
+ * preserves the original all-repos behavior `grasp review --all` now relies
+ * on; passed, it adds a `repo = ?` condition on top of the same
+ * `PENDING_QUESTION_WHERE` definition — this does NOT change what counts as
+ * "pending" (concept-tag memoization stays global, untouched by this — see
+ * DECISIONS.md's `grasp scan` entries), only which already-pending rows get
+ * returned. See DECISIONS.md's "grasp review defaults to the current repo"
+ * entry, which supersedes the earlier "query scope: global" entry now that a
+ * real dogfooding session showed the global default actively confusing
+ * users. `answer_instance IS NULL` alone is a reliable "not yet answered"
+ * check: every real question (question_type "both" or "instance") always
+ * has a non-null question_instance and gets it answered last in `review`'s
+ * concept-then-instance sequence, so it's null iff the event is still
+ * pending regardless of question_type.
+ *
+ * `source` omitted (or undefined) returns pending questions of EVERY source
+ * — what `grasp export` wants. `grasp review` always passes `"diff"` and
+ * `grasp scan` always passes `"scan"`, so each command only ever surfaces
+ * its own kind of pending question, per DECISIONS.md's "grasp scan:
+ * presentation model" entry — the underlying storage stays fully shared,
+ * this only narrows what a given command's own query returns.
  */
-export function getPendingQuestions(db: Database.Database, repoRoot?: string): EventRecord[] {
-  if (repoRoot === undefined) {
-    const rows = db
-      .prepare(`SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} ORDER BY timestamp ASC`)
-      .all();
-    return rows.map(fromEventRow);
+export function getPendingQuestions(db: Database.Database, repoRoot?: string, source?: EventSource): EventRecord[] {
+  const conditions = [PENDING_QUESTION_WHERE];
+  const params: string[] = [];
+  if (repoRoot !== undefined) {
+    conditions.push(`repo = ?`);
+    params.push(repoRoot);
+  }
+  if (source !== undefined) {
+    conditions.push(`source = ?`);
+    params.push(source);
   }
   const rows = db
-    .prepare(`SELECT * FROM events WHERE ${PENDING_QUESTION_WHERE} AND repo = ? ORDER BY timestamp ASC`)
-    .all(repoRoot);
+    .prepare(`SELECT * FROM events WHERE ${conditions.join(" AND ")} ORDER BY timestamp ASC`)
+    .all(...params);
   return rows.map(fromEventRow);
 }
 
@@ -954,32 +1017,62 @@ export function recordHookInvocation(
  * caller can show "about to delete N/M rows" before asking for
  * confirmation, not just after.
  */
-export function getHistoryRowCounts(db: Database.Database): { events: number; conceptTags: number } {
+export function getHistoryRowCounts(db: Database.Database): { events: number; conceptTags: number; scanProgress: number } {
   const events = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
   const conceptTags = (db.prepare(`SELECT COUNT(*) AS n FROM concept_tags`).get() as { n: number }).n;
-  return { events, conceptTags };
+  const scanProgress = (db.prepare(`SELECT COUNT(*) AS n FROM scan_progress`).get() as { n: number }).n;
+  return { events, conceptTags, scanProgress };
 }
 
 /**
- * Wipes stored question/answer history: both `events` and `concept_tags`
- * (a separate table, `event_id`-linked — clearing only one would leave the
- * other stale/orphaned, see this file's schema comment). Irreversible;
- * callers are responsible for confirming with the user first (see
- * `grasp reset history` in reset.ts). Deliberately does NOT touch
- * `cc_turns`/`captured_diffs`/`capture_checkpoints`/`hook_invocations`/
- * `generation_reservations` — those are session/turn bookkeeping, not
- * "history" in the question/answer sense this command promises to reset,
- * and clearing them isn't needed for `events`/`concept_tags` to be
- * consistent with each other.
+ * Wipes stored question/answer history: `events`, `concept_tags` (a
+ * separate table, `event_id`-linked — clearing only one would leave the
+ * other stale/orphaned, see this file's schema comment), AND
+ * `scan_progress`. Irreversible; callers are responsible for confirming
+ * with the user first (see `grasp reset history` in reset.ts). Deliberately
+ * does NOT touch `cc_turns`/`captured_diffs`/`capture_checkpoints`/
+ * `hook_invocations`/`generation_reservations` — those are session/turn
+ * bookkeeping, not "history" in the question/answer sense this command
+ * promises to reset, and clearing them isn't needed for `events`/
+ * `concept_tags` to be consistent with each other. `scan_progress` IS
+ * cleared here, as a deliberate exception to that rule: `grasp scan`'s own
+ * "nothing left to scan" message points at `grasp reset history` as the way
+ * to scan from scratch (see DECISIONS.md's `grasp scan` entries), so this is
+ * the one bookkeeping table reset history is explicitly documented to also
+ * reset — leaving it untouched would make that pointer a dead end.
  */
-export function clearHistory(db: Database.Database): { events: number; conceptTags: number } {
+export function clearHistory(db: Database.Database): { events: number; conceptTags: number; scanProgress: number } {
   const counts = getHistoryRowCounts(db);
   const run = db.transaction(() => {
     db.prepare(`DELETE FROM concept_tags`).run();
     db.prepare(`DELETE FROM events`).run();
+    db.prepare(`DELETE FROM scan_progress`).run();
   });
   run();
   return counts;
+}
+
+// --- grasp scan: file-walk resumability -------------------------------------
+
+/**
+ * Every file path already recorded as scanned for `repo`, as a `Set` for
+ * cheap membership checks against a potentially large tracked-file list.
+ * Permanent — see `scan_progress`'s own schema comment for why there's no
+ * hash/mtime invalidation.
+ */
+export function getScannedFilePaths(db: Database.Database, repo: string): Set<string> {
+  const rows = db.prepare(`SELECT file_path FROM scan_progress WHERE repo = ?`).all(repo) as Array<{
+    file_path: string;
+  }>;
+  return new Set(rows.map((r) => r.file_path));
+}
+
+/** Marks one file scanned for `repo` — idempotent (a re-scan attempt, which shouldn't happen given the resumability filtering, would just no-op rather than error). */
+export function markFileScanned(db: Database.Database, repo: string, filePath: string): void {
+  db.prepare(
+    `INSERT INTO scan_progress (repo, file_path, scanned_at) VALUES (?, ?, ?)
+     ON CONFLICT(repo, file_path) DO UPDATE SET scanned_at = excluded.scanned_at`
+  ).run(repo, filePath, new Date().toISOString());
 }
 
 export function countHookInvocations(

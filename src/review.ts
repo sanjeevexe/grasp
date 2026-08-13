@@ -15,9 +15,14 @@ import { getPendingQuestions, markConceptAnswered, markEventSkipped, markInstanc
  * there. Events with no `session_id` (e.g. `debug:seed` rows) each form
  * their own singleton group rather than being merged together, since they
  * have no real session relationship to one another. See DECISIONS.md's
- * "grasp review batch ordering/grouping" entry.
+ * "grasp review batch ordering/grouping" entry. Exported (not just used
+ * internally) so `grasp scan` can reuse it unmodified for its own batch
+ * presentation — a scan run's synthetic session_id groups just as correctly
+ * as a real Claude Code one, since this function makes no assumption about
+ * which kind of session produced a group. See DECISIONS.md's "grasp scan:
+ * presentation model" entry.
  */
-function groupForBatchPresentation(events: EventRecord[]): ReviewQueueItem[] {
+export function groupForBatchPresentation(events: EventRecord[]): ReviewQueueItem[] {
   const order: string[] = [];
   const groups = new Map<string, EventRecord[]>();
   for (const event of events) {
@@ -67,11 +72,17 @@ export async function runReview(options: { all?: boolean } = {}): Promise<void> 
 
   const db = openStore();
   const repoRoot = resolveRepoRoot(process.cwd());
-  const pending = options.all ? getPendingQuestions(db) : getPendingQuestions(db, repoRoot);
+  // Always source: "diff" — grasp scan's own questions are strictly its own
+  // command's concern (see DECISIONS.md's "grasp scan: presentation model"
+  // entry). The underlying storage stays fully shared; this only narrows
+  // what THIS command's own query surfaces.
+  const pending = options.all
+    ? getPendingQuestions(db, undefined, "diff")
+    : getPendingQuestions(db, repoRoot, "diff");
 
   if (pending.length === 0) {
     if (!options.all) {
-      const elsewhereCount = getPendingQuestions(db).length;
+      const elsewhereCount = getPendingQuestions(db, undefined, "diff").length;
       if (elsewhereCount > 0) {
         process.stdout.write(
           `No pending questions for this repo. ${elsewhereCount} question${elsewhereCount === 1 ? "" : "s"} pending in other repos — run \`grasp review --all\` to see them.\n`
@@ -87,12 +98,24 @@ export async function runReview(options: { all?: boolean } = {}): Promise<void> 
 
   const items = groupForBatchPresentation(pending);
 
+  // Cross-hint (§5): point at `grasp scan` if it has unresolved work of its
+  // own for this repo — same "one-line pointer, only when count > 0" pattern
+  // as the "pending elsewhere" message above, just filtered by source
+  // instead of repo. Always repo-scoped (not affected by --all) since scan
+  // has no cross-repo concept to begin with.
+  const scanPendingCount = getPendingQuestions(db, repoRoot, "scan").length;
+  const crossSourceHint =
+    scanPendingCount > 0
+      ? `→ ${scanPendingCount} scan question${scanPendingCount === 1 ? "" : "s"} also pending — run \`grasp scan\` to continue.`
+      : null;
+
   const { ink, TextInput } = await loadInk();
   const App = createReviewApp({ ink, TextInput });
 
   const instance = ink.render(
     React.createElement(App, {
       items,
+      crossSourceHint,
       // The concept and instance phases each resolve independently now
       // (see reviewApp.tsx's "grasp review: explain-then-retry skip flow"
       // comment) — a real concept answer is persisted as soon as it's

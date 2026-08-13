@@ -13,6 +13,7 @@ export const DEFAULT_CONFIG: GraspConfig = {
     maxSingleFileChangedLines: 800,
   },
   difficultyMode: "medium",
+  scanQuestionsCap: 15,
 };
 
 export interface LoadedConfig {
@@ -71,6 +72,7 @@ const KNOWN_TOP_LEVEL_KEYS = [
   "questionsPerSessionCap",
   "diffThresholds",
   "difficultyMode",
+  "scanQuestionsCap",
 ] as const;
 
 /**
@@ -159,6 +161,12 @@ function validateConfigOverride(value: unknown, filePath: string): asserts value
   if (value.questionsPerSessionCap !== undefined) {
     if (!Number.isInteger(value.questionsPerSessionCap) || (value.questionsPerSessionCap as number) < 1) {
       errors.push(`questionsPerSessionCap must be a positive integer, got ${JSON.stringify(value.questionsPerSessionCap)}`);
+    }
+  }
+
+  if (value.scanQuestionsCap !== undefined) {
+    if (!Number.isInteger(value.scanQuestionsCap) || (value.scanQuestionsCap as number) < 1) {
+      errors.push(`scanQuestionsCap must be a positive integer, got ${JSON.stringify(value.scanQuestionsCap)}`);
     }
   }
 

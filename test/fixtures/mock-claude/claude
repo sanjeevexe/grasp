@@ -145,5 +145,13 @@ const result = {
   sampleAnswerConcept: `sample answer for concept ${n}`,
   sampleAnswerInstance: `sample answer for instance ${n}`,
   conceptExplanation: `explanation for concept ${n}`,
+  // Only read by parseScanJudgeResponse (grasp scan's own contract) —
+  // parseJudgeResponse (the diff contract) reads specific keys off the
+  // parsed object and never rejects unknown extras, so including these
+  // unconditionally is safe for every existing diff-side test too. A fixed
+  // small range is fine here — computeValidatedExcerpt clamps it to
+  // whatever the real file's line count actually is.
+  citedLineStart: 1,
+  citedLineEnd: 2,
 };
 process.stdout.write(JSON.stringify({ total_cost_usd: cost, result: JSON.stringify(result), is_error: false }));

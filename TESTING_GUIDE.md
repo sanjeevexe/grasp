@@ -85,10 +85,26 @@ Grasp defaults to a gentle reminder, not a hard block. Try both:
 - [ ] Run `grasp reset config` (no `--global`) in a repo with a `.grasp.json` — confirm the file is deleted, not left behind empty.
 - [ ] Run `grasp reset config --global` — confirm `~/.grasp/config.json` is overwritten back to defaults.
 - [ ] Run `grasp reset history` with pending/answered questions in your history. Confirm it asks for `y/N` confirmation and shows the row counts about to be deleted; answer `N` and confirm nothing was deleted.
-- [ ] Run `grasp reset history --yes`. Confirm it deletes without prompting, and reports how many rows were removed from both `events` and `concept_tags` (check directly: `sqlite3 ~/.grasp/history.db "select count(*) from events; select count(*) from concept_tags;"` should both be `0`).
+- [ ] Run `grasp reset history --yes`. Confirm it deletes without prompting, and reports how many rows were removed from `events`, `concept_tags`, and `scan_progress` (check directly: `sqlite3 ~/.grasp/history.db "select count(*) from events; select count(*) from concept_tags; select count(*) from scan_progress;"` should all be `0`).
 - [ ] Run `grasp export`, `grasp export --anki`, and `grasp export --raw`. Confirm each prints the full path of a new CSV under `~/.grasp/exports/`, and that running the same command twice produces two different files (timestamped), not one overwritten file.
 - [ ] Open each CSV in a spreadsheet app (or `python3 -c "import csv; print(list(csv.reader(open('<path>'))))"`). Confirm it parses cleanly — especially any row whose question/answer text has a comma, quote, or line break in it.
 - [ ] Confirm `grasp export --anki`'s output message specifically mentions importing into Anki; confirm the default and `--raw` exports don't (just a location confirmation).
+- [ ] If you've used `grasp scan` (see 6c below), confirm its questions show up in `grasp export` too, with `source` correctly set to `scan` (a `source` column in the default/raw shapes; a `source:scan` tag in the Anki shape).
+
+## 6c. `grasp scan` — understanding existing code
+
+`grasp scan` is a genuinely new feature, not a fix — it's a deliberate extension beyond the original brief (onboarding to existing code, not comprehension of AI-agent changes). Try it in a real repo you didn't just create with Claude Code:
+
+- [ ] Run `grasp scan` (no Claude Code session running, nothing set up beyond `grasp init`/normal usage). Confirm it works standalone — no error about a missing session, no dependency on anything else running.
+- [ ] Confirm the same review UI as `grasp review` appears: a concept question, then an instance question, sample answers afterward, Escape-for-a-hint-then-retry — all the same flow. Confirm the instance question shows a short excerpt of the actual file it's about (with line numbers), and the concept question shows no code at all.
+- [ ] Answer or skip through a few questions, then quit (or let it finish). Run `grasp scan` again in the SAME repo. Confirm it does NOT re-ask about files you already saw — it should pick up new, previously-unscanned files instead (or, if none remain, print a clear "nothing left to scan" message pointing at `grasp reset history`).
+- [ ] In a repo with more than one top-level folder (e.g. `src/`, `test/`, `docs/`), run `grasp scan` and pay attention to which files it asks about. Confirm it isn't spending its whole budget inside just one folder — you should see it touch more than one top-level directory before stopping.
+- [ ] Run `grasp scan --full` in a repo with unscanned files left. Confirm you see a plain warning first ("this will scan the entire codebase and could generate a large number of questions...") — NOT a `y/N` confirmation prompt like `grasp reset history` uses — and that it proceeds without you having to answer anything.
+- [ ] Lower the scan cap (`grasp set scan-cap 2`) and confirm `grasp scan` (without `--full`) stops after 2 real questions, not more — and confirm this is completely independent of `questionsPerSessionCap`/`grasp set questions-cap`, which should be untouched.
+- [ ] With both a pending diff question (from normal Claude Code use) AND a pending scan question at the same time: run `grasp review` and confirm you only see the diff question, plus a one-line hint near the end pointing at `grasp scan` for the rest. Then run `grasp scan` and confirm the reverse — only the scan question, plus a hint pointing back at `grasp review`.
+- [ ] The concept-memoization check that matters most: answer a concept question for real via a normal Claude Code diff review, note the concept. Then run `grasp scan` until it would plausibly hit that same concept in an existing file — confirm it does NOT ask the concept question again (instance-only). Then do the reverse: master a concept via `grasp scan` first, and confirm your next real diff review skips re-teaching it too.
+- [ ] Confirm `grasp set mode --easy` (or `--hard`) visibly affects which concepts `grasp scan` favors, the same way it does for diff questions.
+- [ ] Confirm Ctrl+C during a `grasp scan` review is safe — anything not yet answered stays pending for next time, same as `grasp review`.
 
 ## 7. What happens when things go wrong
 
@@ -110,8 +126,10 @@ At the end of the week, answer honestly:
 
 ## Known limitations (so you don't mistake these for bugs)
 
+- **`grasp scan` is a scope extension, not part of the original brief.** It reuses the diff side's storage, judge-call pattern, and review UI on purpose (see README's "grasp scan" section) — worth knowing so its behavior is judged as its own feature, not as a bug in the original diff-comprehension design.
+- **`grasp scan` only sees tracked files, and never re-visits one once scanned.** It reads `git ls-files` (untracked/uncommitted files aren't included), and file-walk progress is permanent — no re-scan on edit. Run `grasp reset history` to start over.
 - **Claude Code only.** No support for other AI coding tools yet.
-- **`grasp review` is manual.** Nothing pops up on its own — you have to run the command yourself. (An "always watching" version may come later if this manual version proves annoying enough.)
+- **`grasp review` is manual.** Nothing pops up on its own — you have to run the command yourself. (An "always watching" version may come later if this manual version proves annoying enough.) `grasp scan` is inherently on-demand too — there's no background scanning.
 - **No answer grading.** Grasp never tells you if your answer was "right" — it never even sees your answer (nothing gets sent back to an LLM after you type it). It shows you a sample answer afterward, generated up front alongside the questions, so you can compare it against your own — that's for your own judgment, not a score from Grasp. The value is still in making you write an answer at all, not in being scored.
 - **One way to generate questions, no backup plan.** If the underlying call fails, times out, or hits your question cap, Grasp skips that question and quietly logs why — it doesn't try a second method. Generation is batched once per Claude Code turn (`Stop`), not once per tool call, and a failed/timed-out attempt isn't lost — the diffs it would have covered stay pending and are folded into the next attempt automatically. There's no dollar-cost cap anymore, so nothing halts an entire session over an uncosted call — see README's "What it costs" section.
 - **`cap_reached` now always means the question cap.** There's only one cap left (`questionsPerSessionCap`), so `miss_reason: "cap_reached"` is unambiguous, and the `Stop` message names the cap value directly when it fires.

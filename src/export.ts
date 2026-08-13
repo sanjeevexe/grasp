@@ -81,18 +81,27 @@ export function buildExportCsv(db: Database.Database, shape: ExportShape, now: D
     // Every concept-question occurrence, answered or skipped, no dedup by
     // tag — a tag asked about more than once produces more than one row.
     // See DECISIONS.md's "grasp export --anki: no dedup by concept tag"
-    // entry.
+    // entry. Already includes grasp-scan-sourced rows for free —
+    // getAllEvents/getConceptTagsGroupedByEvent don't filter by source (see
+    // DECISIONS.md's `grasp scan` entries) — a `source:diff`/`source:scan`
+    // tag is appended to Anki's own Tags field (not a 4th CSV column) so the
+    // established "Front/Back/Tags columns map automatically" contract this
+    // shape promises stays exactly 3 columns; Anki tags are already the
+    // idiomatic place for this kind of extra categorization.
     const conceptRows = events.filter((e) => e.questionConcept !== null);
     const header = ["Front", "Back", "Tags"];
     const rows = conceptRows.map((e) => {
-      const tags = (tagsByEvent.get(e.id as number) ?? []).join(" ");
+      const tags = [...(tagsByEvent.get(e.id as number) ?? []), `source:${e.source ?? "diff"}`].join(" ");
       return [e.questionConcept, e.sampleAnswerConcept ?? "", tags];
     });
     return { csv: toCsv(header, rows), filename: `grasp-export-anki-${ts}.csv`, rowCount: rows.length };
   }
 
   // Default shape: one row per real question (question_type not null),
-  // meant for the user's own spreadsheet review.
+  // meant for the user's own spreadsheet review. Already includes
+  // grasp-scan-sourced rows for free (see the anki-shape comment above) —
+  // the "source" column is what lets a spreadsheet reader tell diff- and
+  // scan-sourced rows apart.
   const questionRows = events.filter((e) => e.questionType !== null);
   const header = [
     "concept_tags",
@@ -104,6 +113,7 @@ export function buildExportCsv(db: Database.Database, shape: ExportShape, now: D
     "sample_instance_answer",
     "timestamp",
     "repo",
+    "source",
   ];
   const rows = questionRows.map((e) => {
     const tags = (tagsByEvent.get(e.id as number) ?? []).join("; ");
@@ -117,6 +127,7 @@ export function buildExportCsv(db: Database.Database, shape: ExportShape, now: D
       e.sampleAnswerInstance ?? "",
       e.timestamp,
       e.repo,
+      e.source ?? "diff",
     ];
   });
   return { csv: toCsv(header, rows), filename: `grasp-export-${ts}.csv`, rowCount: rows.length };

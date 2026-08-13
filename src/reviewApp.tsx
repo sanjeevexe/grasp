@@ -46,6 +46,16 @@ export interface ReviewAppProps {
   items: ReviewQueueItem[];
   /** Called exactly once per event, when its `grasp review` pass concludes — see `ReviewOutcome`'s own comment for what each field means. */
   onResolved: (eventId: number, outcome: ReviewOutcome) => void;
+  /**
+   * A one-line pointer to the OTHER source's command, shown on the last
+   * question of this batch when there's unresolved work waiting there — e.g.
+   * `grasp review`'s last question hints at `grasp scan` when scan questions
+   * are pending, and vice versa. Computed once, upfront, by the caller
+   * (review.ts / scan.ts already own all DB access for this flow; this
+   * component has none) — null/omitted shows nothing. See DECISIONS.md's
+   * "grasp scan: presentation model" entry.
+   */
+  crossSourceHint?: string | null;
 }
 
 export interface RenderLine {
@@ -91,6 +101,38 @@ export function flattenDiffFiles(files: DiffFile[], width: number): RenderLine[]
     }
   }
   return lines;
+}
+
+/**
+ * Renders a `grasp scan` instance question's cited excerpt (§4) — a
+ * DiffFile can't express "an excerpt of unchanged, existing code" (its
+ * whole shape is "what changed"), so this is a small, separate sibling to
+ * `flattenDiffFiles` rather than shoehorning the excerpt into that type.
+ * Reuses the same `wrapLine`/`RenderLine` machinery, so it renders through
+ * the identical `DiffView` component. `excerpt` is already validated/
+ * clamped at generation time (`computeValidatedExcerpt`, generation.ts) —
+ * this function trusts it as-is; null means "nothing to show" (a concept
+ * question, or a malformed/degenerate range), not an error.
+ */
+export function flattenScanExcerpt(
+  filePath: string,
+  excerpt: { startLine: number; endLine: number; lines: string[] } | null,
+  width: number
+): RenderLine[] {
+  if (!excerpt) return [];
+  const lineNoWidth = String(excerpt.endLine).length;
+  const out: RenderLine[] = [];
+  const pushWrapped = (text: string, kind: RenderLine["kind"]) => {
+    for (const chunk of wrapLine(text.length > 0 ? text : " ", width)) {
+      out.push({ text: chunk, kind });
+    }
+  };
+  pushWrapped(`${filePath}  (lines ${excerpt.startLine}-${excerpt.endLine})`, "file");
+  excerpt.lines.forEach((line, i) => {
+    const lineNo = String(excerpt.startLine + i).padStart(lineNoWidth);
+    pushWrapped(`${lineNo}| ${line}`, "context");
+  });
+  return out;
 }
 
 const LINE_COLOR: Record<RenderLine["kind"], string | undefined> = {
@@ -173,14 +215,32 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     // paddingX={1} (1 each side) — content narrower than that is what
     // actually fits without ink's own wrapping kicking in a second time.
     const diffContentWidth = Math.max(10, columns - 4);
-    const lines = React.useMemo(
-      () => flattenDiffFiles(event.diffFiles ?? [], diffContentWidth),
-      [event, diffContentWidth]
-    );
-    const [scrollOffset, setScrollOffset] = useState(0);
 
     const hasConceptQuestion = Boolean(event.questionConcept);
     const [phase, setPhase] = useState<Phase>(hasConceptQuestion ? "concept" : "instance");
+    const isConceptPhaseGroup = phase === "concept" || phase === "concept-explain" || phase === "concept-reveal";
+
+    // A `grasp scan` row's excerpt is instance-question-specific — concept
+    // questions show no excerpt at all (§4, consistent with the existing
+    // concept/instance philosophy: concept questions stand apart from any
+    // specific code). A diff row's own `diffFiles` is shown throughout
+    // (unchanged, pre-existing behavior) — this only branches for scan.
+    const lines = React.useMemo(() => {
+      if (event.source === "scan") {
+        if (isConceptPhaseGroup) return [];
+        const excerpt =
+          event.scanExcerptStartLine !== null &&
+          event.scanExcerptStartLine !== undefined &&
+          event.scanExcerptEndLine !== null &&
+          event.scanExcerptEndLine !== undefined &&
+          event.scanExcerptLines
+            ? { startLine: event.scanExcerptStartLine, endLine: event.scanExcerptEndLine, lines: event.scanExcerptLines }
+            : null;
+        return flattenScanExcerpt(event.diffSummary ?? "", excerpt, diffContentWidth);
+      }
+      return flattenDiffFiles(event.diffFiles ?? [], diffContentWidth);
+    }, [event, diffContentWidth, isConceptPhaseGroup]);
+    const [scrollOffset, setScrollOffset] = useState(0);
     // Null until that phase concludes with a REAL answer (first attempt or
     // retry) — stays null if the phase is ultimately declined, or never
     // applicable (no concept question at all). This one nullable field is
@@ -443,9 +503,11 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
       <Box flexDirection="column">
         <Text bold>{event.repo}</Text>
         <Text dimColor>{event.diffSummary}</Text>
-        <Box marginTop={1}>
-          <DiffView lines={lines} scrollOffset={scrollOffset} maxRows={maxDiffRows} />
-        </Box>
+        {lines.length > 0 ? (
+          <Box marginTop={1}>
+            <DiffView lines={lines} scrollOffset={scrollOffset} maxRows={maxDiffRows} />
+          </Box>
+        ) : null}
         <Box marginTop={1} flexDirection="column">
           <Text bold>
             {phase === "concept" || phase === "concept-explain" || phase === "concept-reveal" ? "Concept question:" : "Instance question:"} {questionText}
@@ -512,7 +574,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     );
   }
 
-  function App({ items, onResolved }: ReviewAppProps) {
+  function App({ items, onResolved, crossSourceHint }: ReviewAppProps) {
     const { exit } = useApp();
     const [index, setIndex] = useState(0);
 
@@ -546,6 +608,11 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
     // session's own batch — a lone question from a lone session doesn't
     // need "1 of 1" noise.
     const showSessionContext = current.event.sessionId !== null && (current.sessionSize > 1 || current.batchCount > 1);
+    // Shown once, alongside the LAST question in the batch (bookending
+    // StartBanner's index === 0) — see ReviewAppProps.crossSourceHint's own
+    // comment for why this component just displays a pre-computed string
+    // rather than querying anything itself.
+    const isLastQuestion = index === items.length - 1;
     return (
       <Box flexDirection="column">
         {index === 0 ? <StartBanner items={items} /> : null}
@@ -555,6 +622,7 @@ export function createReviewApp({ ink, TextInput }: InkModules) {
             ? `  ·  session ${current.batchIndex} of ${current.batchCount} (question ${current.sessionPosition} of ${current.sessionSize} for this session)`
             : ""}
         </Text>
+        {isLastQuestion && crossSourceHint ? <Text dimColor>{crossSourceHint}</Text> : null}
         <QuestionScreen
           key={current.event.id}
           event={current.event}

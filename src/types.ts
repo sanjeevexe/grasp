@@ -4,6 +4,18 @@ export type GateMode = "soft" | "hard";
 
 export type DifficultyMode = "easy" | "medium" | "hard";
 
+/**
+ * `'diff'` — generated from a change an AI coding agent made (the original,
+ * brief-scoped path). `'scan'` — generated from `grasp scan` reading through
+ * existing, unfamiliar code, not a change at all. This is a deliberate
+ * extension beyond the original brief's scope (onboarding to existing code,
+ * not comprehension of agent-made changes) — see DECISIONS.md's `grasp scan`
+ * entries. Concept-tag memoization (`concept_tags.answered`) is intentionally
+ * shared and unscoped by source: a concept mastered via either path counts as
+ * mastered for the other.
+ */
+export type EventSource = "diff" | "scan";
+
 export interface DiffThresholds {
   minChangedLines: number;
   maxTotalChangedLines: number;
@@ -21,9 +33,19 @@ export interface GraspConfig {
    * a chosen concept's question is written (see FUTURE_IDEAS.md item 2 for
    * that deliberately-rejected idea, and DECISIONS.md's "difficultyMode
    * scope" entry). `"medium"` leaves the judge prompt's existing, already-
-   * shipped behavior completely unchanged.
+   * shipped behavior completely unchanged. Also read by `grasp scan` — see
+   * DECISIONS.md's `grasp scan` entries.
    */
   difficultyMode: DifficultyMode;
+  /**
+   * `grasp scan`'s own independent question-count cap, deliberately separate
+   * from `questionsPerSessionCap` (which governs live, hook-driven Claude
+   * Code sessions and must not be touched by scan) — see DECISIONS.md's
+   * "grasp scan: no slot-locking..." entry for how a scan run's own fresh
+   * synthetic `session_id` is what actually keeps these two caps isolated
+   * from each other. `grasp scan --full` bypasses this entirely.
+   */
+  scanQuestionsCap: number;
 }
 
 export interface EventRecord {
@@ -101,6 +123,30 @@ export interface EventRecord {
    * explanation screen.
    */
   conceptExplanation?: string | null;
+  /**
+   * `'diff'` (an AI-agent change) or `'scan'` (`grasp scan` reading existing
+   * code) — see `EventSource`'s own comment. Optional, defaulting to
+   * `"diff"` in `toEventRow`, so every pre-scan call site (recordMiss,
+   * `debug:seed`, the existing test suite) — all implicitly diff-sourced —
+   * doesn't need to change. See DECISIONS.md's "grasp scan: storage design"
+   * entry.
+   */
+  source?: EventSource;
+  /**
+   * The §4 cited-excerpt contract for a scan-sourced INSTANCE question only
+   * — which lines of the scanned file the question is actually about.
+   * Computed and clamped/validated once at generation time
+   * (`computeValidatedExcerpt`, generation.ts) and persisted verbatim; never
+   * re-derived from disk later. All three of `scanExcerptStartLine`/
+   * `scanExcerptEndLine`/`scanExcerptLines` are null together whenever
+   * there's nothing to show (a concept-question render, a declined/miss
+   * row, or a malformed/degenerate cited range) — see DECISIONS.md's
+   * "grasp scan: cited-range validation" entry. Always null for `source ===
+   * "diff"` rows.
+   */
+  scanExcerptStartLine?: number | null;
+  scanExcerptEndLine?: number | null;
+  scanExcerptLines?: string[] | null;
 }
 
 export interface ConceptTagRecord {
