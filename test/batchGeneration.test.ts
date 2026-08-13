@@ -338,3 +338,70 @@ test("internal:hook Stop: hitting the question cap produces the specific cap mes
   );
   assert.match(output.systemMessage, /question.*waiting.*grasp review/);
 });
+
+// --- Prompt 7: visible failure signal on Stop, for both error and timeout --
+
+test("internal:hook Stop: a batch generation attempt that errors produces a visible failure message pointing at `grasp retry`", () => {
+  const rawRepo = initRepoWithCommit();
+  const repo = resolveRepoRoot(rawRepo);
+  const home = mkTempDir("grasp-test-batchgen-home-");
+
+  const dbPath = path.join(home, ".grasp", "history.db");
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const sessionId = "s-error-message";
+  const promptId = "p1";
+
+  const db = openStore(dbPath);
+  upsertTurn(db, { sessionId, promptId, repo });
+  insertCapturedDiff(db, {
+    sessionId,
+    promptId,
+    repo,
+    capturedAt: new Date().toISOString(),
+    diff: {
+      repo,
+      capturedAt: new Date().toISOString(),
+      files: [diffFile({ path: "a.ts", insertions: 10, deletions: 1 })],
+      rawDiffText: "",
+      diffHash: null,
+    },
+    filtered: false,
+    filterReason: null,
+    significantFiles: [diffFile({ path: "a.ts", insertions: 10, deletions: 1 })],
+  });
+  db.close();
+
+  const payload = JSON.stringify({ session_id: sessionId, prompt_id: promptId, hook_event_name: "Stop", cwd: repo });
+  const result = spawnSync(process.execPath, [CLI_PATH, "internal:hook"], {
+    cwd: repo,
+    env: { ...process.env, HOME: home, PATH: `${FIXTURE_CLAUDE_DIR}:${process.env.PATH}`, GRASP_TEST_MOCK_MODE: "error" },
+    input: payload,
+  });
+
+  assert.equal(result.status, 0);
+  const stdout = result.stdout.toString();
+  assert.ok(stdout.length > 0, "an error'd attempt must still produce a visible systemMessage");
+  const output = JSON.parse(stdout);
+  assert.match(
+    output.systemMessage,
+    /A comprehension question failed to generate \(error\) — it'll retry automatically on this session's next turn, or run `grasp retry` now\./
+  );
+
+  // The diff must be left unresolved for retry — same invariant
+  // runBatchGeneration's own error-path tests already cover, checked here
+  // too since it's exactly what the new message promises the user.
+  const db2 = openStore(dbPath);
+  assert.equal(getUnresolvedCapturedDiffs(db2, sessionId, repo).length, 1);
+  db2.close();
+});
+
+// A real GENERATION_TIMEOUT_MS-triggered timeout takes ~20s to force
+// deliberately (the same reason test/scanGeneration.test.ts's own timeout
+// test declines to force one) — too slow for this suite. The Stop-message
+// code this test would otherwise cover treats "error" and "timeout"
+// identically (`missReason === "error" || missReason === "timeout"`, same
+// `generationFailureMessage` call, differing only in which string is
+// substituted into it — see cli.ts), and "timeout" classification itself is
+// already covered directly by isTimeoutError's own unit tests in
+// generation.test.ts. The "error" test above proves the wiring; this note
+// documents why "timeout" isn't separately forced end-to-end here.

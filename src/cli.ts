@@ -6,7 +6,7 @@ import { GitDiffAdapter } from "./adapters/gitDiffCapture";
 import { loadConfig } from "./config";
 import { resolveRepoRoot } from "./git";
 import { evaluateCapturedDiff } from "./filter";
-import { runBatchGeneration } from "./generation";
+import { runBatchGeneration, runRetryGeneration } from "./generation";
 import {
   getBlockingPendingQuestionsForSession,
   getConceptTagsByEventId,
@@ -41,6 +41,7 @@ Usage:
   grasp review --all             Same, but across every repo Grasp has ever touched
   grasp scan                     Read through existing, unfamiliar code and ask comprehension questions about it (standalone, no Claude Code session needed)
   grasp scan --full              Same, but bypasses the scan question cap entirely (warns first, doesn't gate)
+  grasp retry                    Retry every unresolved captured diff for this repo (e.g. a stuck timeout/error), across any session
   grasp set mode --easy|--medium|--hard [--global]  Set concept-selection difficulty preference (repo-local, or --global)
   grasp set gate soft|hard [--global]               Set gateMode (repo-local, or --global)
   grasp set questions-cap <n> [--global]            Set questionsPerSessionCap, the live-session cap (repo-local, or --global)
@@ -233,6 +234,58 @@ function runDebugCapture(repoPathArg: string | undefined): void {
   );
 }
 
+/**
+ * `grasp retry` — manually retries every unresolved captured diff for the
+ * current repo, across every session, not just the one that captured them.
+ * Previously the only way a diff got retried was another `Stop` firing in
+ * the exact same, still-live Claude Code session that captured it (see
+ * prompts/07_retry_command.md's problem statement) — a diff left unresolved
+ * by a session that has since ended had no path back at all. Standalone,
+ * same dispatch pattern as `grasp scan`: no live session required, prints a
+ * result and exits, no interactive UI (generation itself never presents —
+ * see `grasp review` for that).
+ */
+async function runRetry(): Promise<void> {
+  const repoRoot = resolveRepoRoot(process.cwd());
+  const { config } = loadConfig(repoRoot);
+  const db = openStore();
+  try {
+    const { outcome, diffCount } = runRetryGeneration(db, { repo: repoRoot, config });
+
+    if (outcome === null) {
+      process.stdout.write("Nothing to retry — no unresolved captured diffs for this repo.\n");
+      return;
+    }
+
+    if (outcome.missReason === "error" || outcome.missReason === "timeout") {
+      process.stdout.write(
+        `Retry attempt failed (${outcome.missReason}) — ${diffCount} diff${diffCount === 1 ? "" : "s"} remain unresolved. Run \`grasp retry\` again to try once more.\n`
+      );
+      return;
+    }
+
+    if (outcome.missReason === "cap_reached") {
+      process.stdout.write(
+        `Hit this session's question cap (${config.questionsPerSessionCap}) — the ${diffCount} diff${diffCount === 1 ? "" : "s"} covered are now marked resolved (a cap hit is a final verdict, not a failure). Run \`grasp set questions-cap <n>\` to raise it.\n`
+      );
+      return;
+    }
+
+    if (outcome.questionType !== null) {
+      process.stdout.write(
+        `Generated a new question from ${diffCount} previously-stuck diff${diffCount === 1 ? "" : "s"} — run \`grasp review\` to see it.\n`
+      );
+      return;
+    }
+
+    process.stdout.write(
+      `Reviewed ${diffCount} previously-stuck diff${diffCount === 1 ? "" : "s"} — none were worth a question. Marked resolved.\n`
+    );
+  } finally {
+    db.close();
+  }
+}
+
 function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -275,6 +328,20 @@ function costSummaryMessage(costUsd: number): string {
  */
 function questionCapMessage(cap: number): string {
   return `You've hit this session's question cap (${cap}) — start a new Claude Code session, or run \`grasp set questions-cap <n>\` to raise it.`;
+}
+
+/**
+ * Visible failure signal for a batch generation attempt that produced
+ * `missReason` "error" or "timeout" — previously these were entirely
+ * silent (see prompts/07_retry_command.md): a hung/erroring attempt left
+ * its diffs unresolved with no indication to the user that anything had
+ * gone wrong, or that a fix (`grasp retry`) even existed. The diffs it
+ * covered stay unresolved (see `runBatchGeneration`) and are automatically
+ * retried on this session's next `Stop` firing — this message just makes
+ * that fact visible in the meantime.
+ */
+function generationFailureMessage(reason: "error" | "timeout"): string {
+  return `A comprehension question failed to generate (${reason}) — it'll retry automatically on this session's next turn, or run \`grasp retry\` now.`;
 }
 
 /**
@@ -364,6 +431,9 @@ async function runInternalHook(): Promise<void> {
         if (spentSoFar > 0) messageParts.push(costSummaryMessage(spentSoFar));
         if (batchOutcome?.missReason === "cap_reached") {
           messageParts.push(questionCapMessage(config.questionsPerSessionCap));
+        }
+        if (batchOutcome?.missReason === "error" || batchOutcome?.missReason === "timeout") {
+          messageParts.push(generationFailureMessage(batchOutcome.missReason));
         }
         if (messageParts.length > 0) {
           hookOutput = { systemMessage: messageParts.join(" ") };
@@ -493,6 +563,13 @@ async function main(): Promise<void> {
     // payload, same dispatch pattern as `init`/`review` above.
     const full = args.slice(1).includes("--full");
     await runScan({ full });
+    return;
+  }
+
+  if (command === "retry") {
+    // Fully standalone, same dispatch pattern as `scan` above — no hook
+    // payload, no live session required.
+    await runRetry();
     return;
   }
 

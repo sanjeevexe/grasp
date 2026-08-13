@@ -939,6 +939,26 @@ export function getUnresolvedCapturedDiffs(
 }
 
 /**
+ * Same shape as `getUnresolvedCapturedDiffs`, but scoped to `repo` alone,
+ * across every `session_id` — for `grasp retry`, which has no live session
+ * to scope itself to (a diff's originating Claude Code session may have
+ * ended long ago). `Stop`-triggered batch generation stays session-scoped
+ * (see `getUnresolvedCapturedDiffs`'s own comment for why); this is the
+ * deliberately broader sibling for the one caller that actually needs it.
+ */
+export function getUnresolvedCapturedDiffsForRepo(
+  db: Database.Database,
+  repo: string
+): CapturedDiffRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM captured_diffs WHERE repo = ? AND filtered = 0 AND resolved = 0 ORDER BY captured_at ASC`
+    )
+    .all(repo) as any[];
+  return rows.map(fromCapturedDiffRow);
+}
+
+/**
  * Marks a set of `captured_diffs` rows resolved — called once a batched
  * generation attempt that covered them concludes with a real outcome (see
  * `getUnresolvedCapturedDiffs`'s comment). A no-op on an empty list so

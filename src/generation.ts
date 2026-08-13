@@ -1,13 +1,16 @@
 import { execFileSync } from "child_process";
+import { randomUUID } from "crypto";
 import Database from "better-sqlite3";
 import { DiffFile } from "./adapters/agentAdapter";
 import { DifficultyMode, GraspConfig } from "./types";
 import {
+  CapturedDiffRecord,
   GENERATION_RESERVATION_STALE_MS,
   getAllAnsweredConceptTags,
   getConceptTagGlobal,
   getSessionQuestionCount,
   getUnresolvedCapturedDiffs,
+  getUnresolvedCapturedDiffsForRepo,
   insertEvent,
   markCapturedDiffsResolved,
   releaseGenerationSlot,
@@ -804,7 +807,24 @@ export function runBatchGeneration(db: Database.Database, params: BatchGeneratio
   const { sessionId, repo, config } = params;
   const pending = getUnresolvedCapturedDiffs(db, sessionId, repo);
   if (pending.length === 0) return null;
+  return runGenerationForCapturedDiffs(db, sessionId, repo, config, pending);
+}
 
+/**
+ * Shared by `runBatchGeneration` (session-scoped, `Stop`-triggered) and
+ * `runRetryGeneration` (repo-scoped, `grasp retry`-triggered) — both reduce
+ * to "run one attempt covering this already-gathered list of pending
+ * captured diffs, then resolve or leave them for retry based on the
+ * outcome," differing only in how the list was gathered and which
+ * `session_id` the resulting event is recorded under.
+ */
+function runGenerationForCapturedDiffs(
+  db: Database.Database,
+  sessionId: string,
+  repo: string,
+  config: GraspConfig,
+  pending: CapturedDiffRecord[]
+): GenerationOutcome {
   const diffGroups = pending.map((row) => row.significantFiles ?? []);
   // Purely informational (see EventRecord.diffHash) — concatenates every
   // covered diff's own hash rather than picking one arbitrarily.
@@ -820,6 +840,41 @@ export function runBatchGeneration(db: Database.Database, params: BatchGeneratio
   }
 
   return outcome;
+}
+
+export interface RetryGenerationParams {
+  repo: string;
+  config: GraspConfig;
+}
+
+export interface RetryGenerationResult {
+  outcome: GenerationOutcome | null;
+  diffCount: number;
+}
+
+/**
+ * `grasp retry`'s entry point — gathers every unresolved captured diff for
+ * the current repo across EVERY `session_id` (a manual command has no live
+ * session to scope itself to; see `getUnresolvedCapturedDiffsForRepo`'s own
+ * comment), then runs one attempt covering all of them under a fresh
+ * synthetic `session_id` (`retry-${randomUUID()}`), matching the precedent
+ * `grasp scan` already set (`scan-${randomUUID()}`) for a command whose
+ * generated event(s) don't belong to any real Claude Code session. See
+ * DECISIONS.md's "grasp retry: cap behavior" entry for why this still runs
+ * through the same `questionsPerSessionCap` check as every other generation
+ * path, rather than special-casing retry as cap-exempt.
+ *
+ * Returns `{ outcome: null, diffCount: 0 }` when there's nothing unresolved
+ * to cover at all.
+ */
+export function runRetryGeneration(db: Database.Database, params: RetryGenerationParams): RetryGenerationResult {
+  const { repo, config } = params;
+  const pending = getUnresolvedCapturedDiffsForRepo(db, repo);
+  if (pending.length === 0) return { outcome: null, diffCount: 0 };
+
+  const sessionId = `retry-${randomUUID()}`;
+  const outcome = runGenerationForCapturedDiffs(db, sessionId, repo, config, pending);
+  return { outcome, diffCount: pending.length };
 }
 
 // --- grasp scan: whole-file judge contract -----------------------------------
