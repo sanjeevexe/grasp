@@ -50,10 +50,6 @@ Usage:
   grasp export                   Export your Q&A history to CSV, for your own spreadsheet review
   grasp export --anki            Export concept questions as an Anki-importable Front/Back/Tags CSV
   grasp export --raw             Export every column of every events row, unfiltered
-  grasp debug:seed               (dev) Insert one fake event + concept tag, for verifying the local store
-  grasp debug:capture <repo>     (dev) Run git-diff capture against <repo> and print the resulting diff object
-  grasp debug:answer <event-id>  (dev) Simulate answering an event's concept question (marks its concept tag(s) answered)
-  grasp internal:hook            (internal) Claude Code hook entrypoint — reads a hook payload on stdin
 
 v1 status: config loading, local storage, git-diff capture, Claude Code
 hook-based capture, mechanical meaningful-change filtering, headless
@@ -416,6 +412,13 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0];
 
+  // `internal:hook` — Claude Code hook entrypoint, reads a hook payload on
+  // stdin. Deliberately absent from HELP_TEXT/printHelp: it's wired up by
+  // `grasp init` into .claude/settings.local.json and is never meant to be
+  // typed by a user directly, but it must keep working when invoked by name
+  // (Claude Code itself is the only real caller) — see DECISIONS.md's
+  // "hide dev-only commands from default help output" entry.
+  //
   // internal:hook must never let ensureInitialized's config validation
   // (which can throw on a malformed .grasp.json) escape to this function's
   // own top-level catch below, which sets exitCode = 1 — that would make
@@ -442,6 +445,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `debug:seed` / `debug:capture` / `debug:answer` — dev-only commands for
+  // exercising the local store, git-diff capture, and answer-marking
+  // directly, without a real Claude Code session. Deliberately absent from
+  // HELP_TEXT/printHelp (not meant for end users), but they still run
+  // correctly when invoked by name — see DECISIONS.md's "hide dev-only
+  // commands from default help output" entry.
+  //   grasp debug:seed               Insert one fake event + concept tag, for verifying the local store
+  //   grasp debug:capture <repo>     Run git-diff capture against <repo> and print the resulting diff object
+  //   grasp debug:answer <event-id>  Simulate answering an event's concept question (marks its concept tag(s) answered)
   if (command === "debug:seed") {
     runDebugSeed();
     return;
