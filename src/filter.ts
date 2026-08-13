@@ -64,7 +64,7 @@ export function matchesIgnorePattern(filePath: string, pattern: string): boolean
   return basename === pattern || normalizedPath === pattern;
 }
 
-function classifyIgnoreExclusion(filePath: string, config: GraspConfig): FileExclusionReason | null {
+export function classifyIgnoreExclusion(filePath: string, config: GraspConfig): FileExclusionReason | null {
   if (BASELINE_IGNORE_PATTERNS.some((p) => matchesIgnorePattern(filePath, p))) {
     return "baseline_ignore";
   }

@@ -20,7 +20,8 @@ import {
 } from "./store";
 import { runInit } from "./init";
 import { runReview } from "./review";
-import { runSetMode, runSetGate, runSetQuestionsCap } from "./set";
+import { runScan } from "./scan";
+import { runSetMode, runSetGate, runSetQuestionsCap, runSetScanCap } from "./set";
 import { runResetConfig, runResetHistory } from "./reset";
 import { ExportShape, printExportResult, runExportToFile } from "./export";
 
@@ -38,11 +39,14 @@ Usage:
   grasp init                     Install Grasp's Claude Code hooks into this repo (asks for confirmation)
   grasp review                   Work through pending comprehension questions for this repo, interactively
   grasp review --all             Same, but across every repo Grasp has ever touched
+  grasp scan                     Read through existing, unfamiliar code and ask comprehension questions about it (standalone, no Claude Code session needed)
+  grasp scan --full              Same, but bypasses the scan question cap entirely (warns first, doesn't gate)
   grasp set mode --easy|--medium|--hard [--global]  Set concept-selection difficulty preference (repo-local, or --global)
   grasp set gate soft|hard [--global]               Set gateMode (repo-local, or --global)
-  grasp set questions-cap <n> [--global]            Set questionsPerSessionCap (repo-local, or --global)
+  grasp set questions-cap <n> [--global]            Set questionsPerSessionCap, the live-session cap (repo-local, or --global)
+  grasp set scan-cap <n> [--global]                 Set scanQuestionsCap, grasp scan's own separate cap (repo-local, or --global)
   grasp reset config [--global]  Reset config to defaults (deletes .grasp.json locally, or overwrites the global file)
-  grasp reset history [--yes]    Irreversibly wipe all stored question/answer history (asks to confirm unless --yes)
+  grasp reset history [--yes]    Irreversibly wipe all stored question/answer history, including scan progress (asks to confirm unless --yes)
   grasp export                   Export your Q&A history to CSV, for your own spreadsheet review
   grasp export --anki            Export concept questions as an Anki-importable Front/Back/Tags CSV
   grasp export --raw             Export every column of every events row, unfiltered
@@ -57,8 +61,11 @@ judge+generate question generation, \`grasp review\` for answering questions
 interactively (soft-nudge visibility + opt-in hard-gate), a session-wide
 questions-per-session cap with coherent batch grouping/ordering in
 \`grasp review\`, and a session-end cost summary + pending-question nudge
-surfaced via \`Stop\`'s systemMessage. See README.md for the full picture.
-\`grasp watch\` (persistent, auto-popping review) is not built.
+surfaced via \`Stop\`'s systemMessage. \`grasp scan\` extends this to existing,
+already-written code (not agent changes) — same question machinery, its own
+independent cap and resumable file walk, live-presented via the same review
+UI. See README.md for the full picture. \`grasp watch\` (persistent,
+auto-popping review) is not built.
 `;
 
 function printHelp(): void {
@@ -469,6 +476,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "scan") {
+    // Fully standalone (see DECISIONS.md's `grasp scan` entries) — no hook
+    // payload, same dispatch pattern as `init`/`review` above.
+    const full = args.slice(1).includes("--full");
+    await runScan({ full });
+    return;
+  }
+
   if (command === "set") {
     // Same repo-root resolution every other repo-scoped command uses —
     // `grasp set ...` (no --global) writes to the actual repo root's
@@ -488,7 +503,11 @@ async function main(): Promise<void> {
       runSetQuestionsCap(rest, { repoRoot });
       return;
     }
-    process.stderr.write("Usage: grasp set mode|gate|questions-cap ...\n");
+    if (subcommand === "scan-cap") {
+      runSetScanCap(rest, { repoRoot });
+      return;
+    }
+    process.stderr.write("Usage: grasp set mode|gate|questions-cap|scan-cap ...\n");
     process.exitCode = 1;
     return;
   }

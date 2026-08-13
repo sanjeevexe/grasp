@@ -83,3 +83,30 @@ export function runSetQuestionsCap(args: string[], deps: SetCommandDeps): void {
   setConfigValue(targetPath, "questionsPerSessionCap", n);
   process.stdout.write(`Set questionsPerSessionCap=${n} in ${scopeLabel(global, targetPath)}\n`);
 }
+
+/**
+ * `grasp set scan-cap <n> [--global]` — writes `scanQuestionsCap`, `grasp
+ * scan`'s own independent question-count cap. Deliberately a SEPARATE
+ * command/field from `questions-cap`/`questionsPerSessionCap` above, which
+ * governs live, hook-driven Claude Code sessions — see DECISIONS.md's
+ * `grasp scan` entries for why the two caps must stay isolated.
+ */
+export function runSetScanCap(args: string[], deps: SetCommandDeps): void {
+  const global = args.includes("--global");
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const raw = positional[0];
+  const n = Number(raw);
+
+  // Same validation `validateConfigOverride` already applies to
+  // `scanQuestionsCap` (config.ts) — kept in sync for the same reason
+  // `questions-cap` above does.
+  if (!raw || !Number.isInteger(n) || n < 1) {
+    process.stderr.write("Usage: grasp set scan-cap <positive-integer> [--global]\n");
+    process.exitCode = 1;
+    return;
+  }
+
+  const targetPath = targetConfigPath(deps.repoRoot, global, deps.globalConfigPath ?? GLOBAL_CONFIG_PATH);
+  setConfigValue(targetPath, "scanQuestionsCap", n);
+  process.stdout.write(`Set scanQuestionsCap=${n} in ${scopeLabel(global, targetPath)}\n`);
+}

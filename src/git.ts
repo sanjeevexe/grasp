@@ -87,6 +87,20 @@ export function listUntrackedFiles(repoPath: string): string[] {
 }
 
 /**
+ * Tracked files — `grasp scan`'s file-walk source (see DECISIONS.md's
+ * "grasp scan: file-walk source, ordering, capping, and resumability"
+ * entry): `.gitignore` semantics come for free instead of needing to be
+ * reimplemented, and untracked (uncommitted, scratch/WIP) files are
+ * deliberately excluded — scan is about onboarding to EXISTING code, and
+ * Grasp's diff-capture path already exists to ask about a user's own
+ * in-flight work.
+ */
+export function listTrackedFiles(repoPath: string): string[] {
+  const result = runGit(repoPath, ["ls-files"]);
+  return result.stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+}
+
+/**
  * Resolves the git repository root for `cwd`, so config lookup, checkpoint
  * keying, and hook installation behave the same whether Claude Code's `cwd`
  * for a session is the repo root or some subdirectory of it (e.g. `repo/src`).
