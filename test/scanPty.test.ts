@@ -377,11 +377,9 @@ test(
     const dbPath = path.join(home, ".grasp", "history.db");
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     const db = openStore(dbPath);
-    db.prepare(`INSERT INTO scan_progress (repo, file_path, scanned_at) VALUES (?, ?, ?)`).run(
-      repo,
-      "example.ts",
-      new Date().toISOString()
-    );
+    db.prepare(
+      `INSERT INTO scan_progress (repo, file_path, chunk_index, is_final_chunk, scanned_at) VALUES (?, ?, ?, ?, ?)`
+    ).run(repo, "example.ts", 0, 1, new Date().toISOString());
     db.close();
 
     const result = await runScanPty(

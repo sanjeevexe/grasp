@@ -10,14 +10,16 @@ import { createReviewApp } from "./reviewApp";
 import { groupForBatchPresentation } from "./review";
 import { runScanFileGeneration } from "./generation";
 import { DiffFile } from "./adapters/agentAdapter";
+import { FileChunk, splitFileIntoChunks } from "./scanChunking";
 import {
   getPendingQuestions,
-  getScannedFilePaths,
+  getScanCompletedFilePaths,
+  getScannedChunkIndexes,
   getSessionCostUsd,
   getSessionQuestionCount,
+  markChunkScanned,
   markConceptAnswered,
   markEventSkipped,
-  markFileScanned,
   markInstanceAnswered,
   openStore,
 } from "./store";
@@ -32,10 +34,23 @@ import {
  * file. Fully standalone: no Claude Code hook payload, no live session
  * required, and (via a fresh synthetic `session_id` per run) fully isolated
  * from any live session's own `questionsPerSessionCap`.
+ *
+ * Large files are split into sequential chunks (see `scanChunking.ts`) so a
+ * big file gets proportionally more chances at a question rather than the
+ * old "one shot, forever" per-file treatment — see DECISIONS.md's "grasp
+ * scan: chunking for large files" entry for the full redesign this file
+ * implements.
  */
 
-/** Skip a file's content entirely past this many lines — there is no diffThresholds equivalent for scan (deliberately, per the task's own instruction); this is a separate, hardcoded, non-configurable safety guard. See DECISIONS.md's "grasp scan: file-walk source, ordering, capping, and resumability" entry. */
-const MAX_SCAN_FILE_LINES = 2000;
+/**
+ * Purely defensive ceiling, replacing the old MAX_SCAN_FILE_LINES (2000) —
+ * chunking now handles arbitrarily large legitimate source files, so this
+ * only exists to refuse pathological cases (a vendored dump, a minified
+ * bundle that slipped past .gitignore) rather than to bound normal chunking.
+ * See DECISIONS.md's "grasp scan: chunking for large files" entry for why
+ * 20,000.
+ */
+const MAX_SCAN_CEILING_LINES = 20_000;
 
 /** How many bytes from the start of a file are sniffed for a NUL byte to decide "this is binary, not source code" — cheap and reliable enough for a defensive pre-generation guard, not a full content-type detector. */
 const BINARY_SNIFF_BYTES = 8192;
@@ -69,7 +84,9 @@ function toWholeFileDiffFile(relPath: string): DiffFile {
  * Purely mechanical, no file I/O or judge calls, so a capped run's budget
  * naturally spreads across the repo instead of being able to land entirely
  * inside whichever directory happens to sort first. Exported for direct
- * testing. See DECISIONS.md's "grasp scan: file-walk source, ordering,
+ * testing. Unchanged by chunking (Prompt 8) — it still orders whole FILES;
+ * `runScanWalk` below is what advances each file one CHUNK per pass through
+ * this order. See DECISIONS.md's "grasp scan: file-walk source, ordering,
  * capping, and resumability" entry.
  */
 export function orderFilesRoundRobin(paths: string[]): string[] {
@@ -101,31 +118,68 @@ export function orderFilesRoundRobin(paths: string[]): string[] {
   return result;
 }
 
+export interface OversizedSkip {
+  filePath: string;
+  lineCount: number;
+}
+
 /**
- * Reads and mechanically evaluates one file, either calling
- * `runScanFileGeneration` or skipping it — and either way, decides whether
- * to mark the file scanned. A successful attempt (real question, legitimate
- * decline, or a mechanical skip with nothing to learn — ignored, generated,
- * binary, too large) marks the file scanned permanently. A failed judge
- * call (`error`/`timeout`) leaves it unscanned for retry on a later run,
- * the same "successful vs. failed attempt" distinction the diff side's
- * batched-at-Stop redesign already established.
+ * Per-file, per-run walk state — classified lazily, the first time a file
+ * comes up in the round-robin order, so a file whose turn never comes (the
+ * cap was hit first) is never even read off disk. `chunks: null` means the
+ * file was mechanically resolved (ignored/generated/unreadable/binary/
+ * oversized) rather than really chunked — it's already `done` the moment
+ * it's classified, with a single chunk_index=0 progress row marking it.
+ *
+ * `done` and `stuckThisRun` are deliberately separate: `done` means the
+ * file's walk is genuinely, permanently complete (DB-true — every chunk has
+ * a progress row). `stuckThisRun` means one chunk's generation attempt
+ * FAILED (error/timeout) this walk — that chunk is left unmarked for retry
+ * on a later `grasp scan` run (matching the pre-chunking behavior a failed
+ * whole-file attempt already had), and this file isn't reattempted again
+ * within the SAME walk invocation (no immediate same-run retry loop), but
+ * it is very much not `done`. Conflating the two would either retry a
+ * failing chunk forever within one run, or — worse — advance past it to a
+ * LATER chunk index whose own success would leave a gap in `scan_progress`
+ * (chunk N missing, chunk N+1 present), breaking the "resume from the
+ * smallest unscanned index" assumption `classifyFile` relies on.
  */
-function processOneFile(
+interface FileWalkState {
+  chunks: FileChunk[] | null;
+  totalFileLines: number;
+  nextChunkCursor: number;
+  done: boolean;
+  stuckThisRun: boolean;
+}
+
+/**
+ * Reads and mechanically classifies one file the first time the walk visits
+ * it: ignore pattern / generated-file detection (no content read), then
+ * unreadable / binary / over-the-defensive-ceiling (each requires reading
+ * the file once). Any of these mechanically resolves the file in one step —
+ * a single `chunk_index=0`, `is_final_chunk=1` progress row, matching the
+ * same permanence every other skip category already had before chunking.
+ * Otherwise splits the file into chunks (`scanChunking.ts`) and resumes
+ * from whatever chunk index isn't already recorded for it (a partially
+ * covered multi-chunk file from an earlier run).
+ */
+function classifyFile(
   db: ReturnType<typeof openStore>,
   repoRoot: string,
-  sessionId: string,
   config: ReturnType<typeof loadConfig>["config"],
-  filePath: string
-): void {
+  filePath: string,
+  oversizedSkips: OversizedSkip[]
+): FileWalkState {
+  const markFullyDone = () => markChunkScanned(db, repoRoot, filePath, 0, true);
+
   const ignoreReason = classifyIgnoreExclusion(filePath, config);
   if (ignoreReason) {
-    markFileScanned(db, repoRoot, filePath);
-    return;
+    markFullyDone();
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
   }
   if (isFileGenerated(toWholeFileDiffFile(filePath), repoRoot)) {
-    markFileScanned(db, repoRoot, filePath);
-    return;
+    markFullyDone();
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
   }
 
   let buffer: Buffer;
@@ -134,27 +188,61 @@ function processOneFile(
   } catch {
     // Unreadable (permissions, a symlink to nowhere, deleted between the
     // walk listing and now) — nothing productive to retry here.
-    markFileScanned(db, repoRoot, filePath);
-    return;
+    markFullyDone();
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
   }
 
   if (looksBinary(buffer)) {
-    markFileScanned(db, repoRoot, filePath);
-    return;
+    markFullyDone();
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
   }
 
   const fileLines = buffer.toString("utf-8").split(/\r\n|\r|\n/);
-  if (fileLines.length > MAX_SCAN_FILE_LINES) {
-    markFileScanned(db, repoRoot, filePath);
-    return;
+  if (fileLines.length > MAX_SCAN_CEILING_LINES) {
+    oversizedSkips.push({ filePath, lineCount: fileLines.length });
+    markFullyDone();
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
   }
 
-  const outcome = runScanFileGeneration(db, { sessionId, repo: repoRoot, filePath, fileLines, config });
+  const chunks = splitFileIntoChunks(fileLines);
+  const alreadyScanned = getScannedChunkIndexes(db, repoRoot, filePath);
+  let cursor = 0;
+  while (cursor < chunks.length && alreadyScanned.has(cursor)) cursor++;
+
+  return { chunks, totalFileLines: fileLines.length, nextChunkCursor: cursor, done: cursor >= chunks.length, stuckThisRun: false };
+}
+
+/**
+ * Runs one real generation call scoped to exactly this chunk's lines — same
+ * concept-tag memoization rules as every other call (global, per
+ * `getAllAnsweredConceptTags`), just applied at chunk granularity instead
+ * of whole-file. Marks the chunk scanned only on a genuine outcome (a real
+ * question or a legitimate decline) — a failed/timed-out attempt leaves it
+ * unmarked, retried on a later `grasp scan` run from this same chunk index.
+ */
+function processOneChunk(
+  db: ReturnType<typeof openStore>,
+  repoRoot: string,
+  sessionId: string,
+  config: ReturnType<typeof loadConfig>["config"],
+  filePath: string,
+  chunk: FileChunk,
+  totalFileLines: number
+): boolean {
+  const outcome = runScanFileGeneration(db, {
+    sessionId,
+    repo: repoRoot,
+    filePath,
+    fileLines: chunk.lines,
+    config,
+    baseLineNumber: chunk.startLine,
+    totalFileLines,
+  });
   if (outcome.missReason === null) {
-    markFileScanned(db, repoRoot, filePath);
+    markChunkScanned(db, repoRoot, filePath, chunk.chunkIndex, chunk.isFinal);
+    return true;
   }
-  // missReason "error"/"timeout": deliberately left unscanned — retried on
-  // a later `grasp scan` run, combined with whatever else is still unscanned.
+  return false;
 }
 
 function pluralQuestions(n: number): string {
@@ -162,35 +250,85 @@ function pluralQuestions(n: number): string {
 }
 
 export interface ScanWalkResult {
-  filesWalked: number;
-  /** True if `scanQuestionsCap` stopped the walk before it reached the end of `orderedUnscanned` — never true when `full` is passed. */
+  /** Real generation calls made this walk (one per chunk actually processed) — the unit `scanQuestionsCap`-style capping and Prompt 10's run summary both care about, distinct from `filesTouched` now that one file can span many chunks. */
+  chunksProcessed: number;
+  /** Distinct files with at least one chunk processed OR mechanically resolved this walk. */
+  filesTouched: number;
+  /** True if `scanQuestionsCap` stopped the walk before it reached the end of `orderedCandidates` — never true when `full` is passed. */
   capped: boolean;
+  /** Files skipped for being over MAX_SCAN_CEILING_LINES this walk — `runScan` prints a visible message for each. */
+  oversizedSkips: OversizedSkip[];
 }
 
 /**
- * The file-walk itself — capping, per-file processing, resumability
- * tracking — with no dependency on a terminal or the review UI, so it's
- * directly testable on its own. `runScan` below is a thin wrapper that adds
- * the interactive TTY requirement, upfront file listing/ordering, and
- * live presentation around this.
+ * The file-walk itself — capping, chunk-granularity round-robin, per-chunk
+ * processing, resumability tracking — with no dependency on a terminal or
+ * the review UI, so it's directly testable on its own. `runScan` below is a
+ * thin wrapper that adds the interactive TTY requirement, upfront file
+ * listing/ordering, and live presentation around this.
+ *
+ * `orderedCandidates` is the round-robin FILE order from
+ * `orderFilesRoundRobin` — this function is what turns that into
+ * chunk-granularity interleaving: each pass over the full order advances
+ * every file that still has remaining chunks by exactly one chunk, and
+ * files are classified (read, and either mechanically resolved or split
+ * into chunks) lazily, the first time their turn comes up — never upfront
+ * for the whole candidate list, so a file the cap never reaches is never
+ * read at all. Repeats passes until the cap is hit (unless `full`) or no
+ * pass makes any further progress (everything either mechanically resolved
+ * or chunk-exhausted).
  */
 export function runScanWalk(
   db: ReturnType<typeof openStore>,
   repoRoot: string,
   sessionId: string,
   config: ReturnType<typeof loadConfig>["config"],
-  orderedUnscanned: string[],
+  orderedCandidates: string[],
   full: boolean
 ): ScanWalkResult {
-  let filesWalked = 0;
-  for (const filePath of orderedUnscanned) {
-    if (!full && getSessionQuestionCount(db, sessionId) >= config.scanQuestionsCap) {
-      return { filesWalked, capped: true };
+  const states = new Map<string, FileWalkState>();
+  const oversizedSkips: OversizedSkip[] = [];
+  const filesTouched = new Set<string>();
+  let chunksProcessed = 0;
+
+  let madeProgress = true;
+  while (madeProgress) {
+    madeProgress = false;
+    for (const filePath of orderedCandidates) {
+      if (!full && getSessionQuestionCount(db, sessionId) >= config.scanQuestionsCap) {
+        return { chunksProcessed, filesTouched: filesTouched.size, capped: true, oversizedSkips };
+      }
+
+      let state = states.get(filePath);
+      if (!state) {
+        state = classifyFile(db, repoRoot, config, filePath, oversizedSkips);
+        states.set(filePath, state);
+        if (state.done) {
+          filesTouched.add(filePath);
+          continue;
+        }
+      }
+      if (state.done || state.stuckThisRun) continue;
+
+      const chunk = state.chunks![state.nextChunkCursor];
+      const succeeded = processOneChunk(db, repoRoot, sessionId, config, filePath, chunk, state.totalFileLines);
+      filesTouched.add(filePath);
+      chunksProcessed++;
+      if (succeeded) {
+        state.nextChunkCursor++;
+        if (state.nextChunkCursor >= state.chunks!.length) state.done = true;
+        madeProgress = true;
+      } else {
+        // Leave nextChunkCursor untouched (scan_progress wasn't updated
+        // either) — a failed attempt is retried on a later `grasp scan`
+        // run, not immediately within this same one. See FileWalkState's
+        // own comment for why this must NOT advance the cursor.
+        state.stuckThisRun = true;
+      }
     }
-    processOneFile(db, repoRoot, sessionId, config, filePath);
-    filesWalked++;
   }
-  return { filesWalked, capped: false };
+
+  return { chunksProcessed, filesTouched: filesTouched.size, capped: false, oversizedSkips };
 }
 
 /**
@@ -211,10 +349,10 @@ export async function runScan(options: { full?: boolean } = {}): Promise<void> {
   const db = openStore();
 
   const allTracked = listTrackedFiles(repoRoot);
-  const scannedSet = getScannedFilePaths(db, repoRoot);
-  const unscanned = allTracked.filter((f) => !scannedSet.has(f));
+  const completedSet = getScanCompletedFilePaths(db, repoRoot);
+  const candidates = allTracked.filter((f) => !completedSet.has(f));
 
-  if (unscanned.length === 0) {
+  if (candidates.length === 0) {
     const pendingScan = getPendingQuestions(db, repoRoot, "scan");
     if (pendingScan.length === 0) {
       process.stdout.write(
@@ -231,13 +369,19 @@ export async function runScan(options: { full?: boolean } = {}): Promise<void> {
     );
   } else {
     process.stdout.write(
-      `Scanning up to ${config.scanQuestionsCap} question${config.scanQuestionsCap === 1 ? "" : "s"}' worth of files (${unscanned.length} unscanned file${unscanned.length === 1 ? "" : "s"} remaining)...\n`
+      `Scanning up to ${config.scanQuestionsCap} question${config.scanQuestionsCap === 1 ? "" : "s"}' worth of files (${candidates.length} file${candidates.length === 1 ? "" : "s"} not yet fully covered)...\n`
     );
   }
 
   const sessionId = `scan-${randomUUID()}`;
-  const ordered = orderFilesRoundRobin(unscanned);
-  runScanWalk(db, repoRoot, sessionId, config, ordered, Boolean(options.full));
+  const ordered = orderFilesRoundRobin(candidates);
+  const walkResult = runScanWalk(db, repoRoot, sessionId, config, ordered, Boolean(options.full));
+
+  for (const skip of walkResult.oversizedSkips) {
+    process.stdout.write(
+      `Skipped ${skip.filePath} — ${skip.lineCount} lines, over the ${MAX_SCAN_CEILING_LINES}-line processing ceiling.\n`
+    );
+  }
 
   const spentSoFar = getSessionCostUsd(db, sessionId);
   if (spentSoFar > 0) {

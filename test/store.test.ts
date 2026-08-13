@@ -20,6 +20,10 @@ function tempDbPath(): string {
   return path.join(dir, "history.db");
 }
 
+function mkTempDir(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
 function seedPendingQuestion(db: ReturnType<typeof openStore>, sessionId: string, timestamp: string): number {
   return insertEvent(db, {
     timestamp,
@@ -260,5 +264,91 @@ test("openStore: migrates a pre-`resolved`-column captured_diffs table instead o
     indexes.some((i) => i.name === "idx_captured_diffs_pending"),
     "idx_captured_diffs_pending should still be created after migration"
   );
+  db.close();
+});
+
+// --- Prompt 8: pre-chunking scan_progress migration -------------------------
+//
+// Before chunking, scan_progress had one row per (repo, file_path) meaning
+// "this file was already fully scanned." The chunk-granularity redesign
+// needs a real PRIMARY KEY change (repo, file_path, chunk_index), which
+// SQLite can't do via ALTER TABLE — migrateSchema() renames the old table
+// aside, recreates it, and expands each old row into every chunk the file
+// CURRENTLY has on disk (not just chunk_index=0), so the schema change
+// doesn't trigger stale reprocessing of an already-covered file. See
+// DECISIONS.md's "grasp scan: chunking for large files" entry.
+
+test("openStore: migrates pre-chunking scan_progress rows into every chunk the file currently has, all marked done", () => {
+  const dbPath = tempDbPath();
+  const repo = mkTempDir("grasp-test-scanmigrate-repo-");
+  // 900 lines -> 3 chunks under MAX_SCAN_CHUNK_LINES=400 (400 + 400 + 100).
+  const lines: string[] = [];
+  for (let i = 1; i <= 900; i++) lines.push(`// line ${i}`);
+  fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "src", "big.ts"), lines.join("\n") + "\n");
+
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    CREATE TABLE IF NOT EXISTS scan_progress (
+      repo TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      scanned_at TEXT NOT NULL,
+      PRIMARY KEY (repo, file_path)
+    );
+  `);
+  legacy
+    .prepare(`INSERT INTO scan_progress (repo, file_path, scanned_at) VALUES (?, ?, ?)`)
+    .run(repo, "src/big.ts", "2020-01-01T00:00:00.000Z");
+  legacy.close();
+
+  const db = openStore(dbPath);
+  const columns = db.prepare(`PRAGMA table_info(scan_progress)`).all() as Array<{ name: string }>;
+  assert.ok(columns.some((c) => c.name === "chunk_index"), "chunk_index column should exist after migration");
+  assert.ok(columns.some((c) => c.name === "is_final_chunk"), "is_final_chunk column should exist after migration");
+
+  const rows = db
+    .prepare(`SELECT chunk_index, is_final_chunk FROM scan_progress WHERE repo = ? AND file_path = ? ORDER BY chunk_index ASC`)
+    .all(repo, "src/big.ts") as Array<{ chunk_index: number; is_final_chunk: number }>;
+  assert.deepEqual(
+    rows.map((r) => r.chunk_index),
+    [0, 1, 2],
+    "a 900-line file's 3 CURRENT chunks must all be migrated, not just chunk_index=0"
+  );
+  assert.deepEqual(
+    rows.map((r) => r.is_final_chunk),
+    [0, 0, 1],
+    "only the last chunk should be marked final"
+  );
+
+  const indexes = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'scan_progress'`)
+    .all() as Array<{ name: string }>;
+  assert.ok(indexes.some((i) => i.name === "idx_scan_progress_final"), "idx_scan_progress_final should be created after migration");
+  db.close();
+});
+
+test("openStore: migrating a pre-chunking scan_progress row for an unreadable file (repo gone/moved) falls back to a single final chunk", () => {
+  const dbPath = tempDbPath();
+  const goneRepo = path.join(mkTempDir("grasp-test-scanmigrate-gone-"), "no-longer-here");
+
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    CREATE TABLE IF NOT EXISTS scan_progress (
+      repo TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      scanned_at TEXT NOT NULL,
+      PRIMARY KEY (repo, file_path)
+    );
+  `);
+  legacy
+    .prepare(`INSERT INTO scan_progress (repo, file_path, scanned_at) VALUES (?, ?, ?)`)
+    .run(goneRepo, "src/gone.ts", "2020-01-01T00:00:00.000Z");
+  legacy.close();
+
+  const db = openStore(dbPath);
+  const rows = db
+    .prepare(`SELECT chunk_index, is_final_chunk FROM scan_progress WHERE repo = ? AND file_path = ?`)
+    .all(goneRepo, "src/gone.ts") as Array<{ chunk_index: number; is_final_chunk: number }>;
+  assert.deepEqual(rows, [{ chunk_index: 0, is_final_chunk: 1 }], "an unreadable file must fall back to one final chunk, not error or lose the row");
   db.close();
 });

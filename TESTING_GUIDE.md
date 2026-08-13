@@ -112,9 +112,16 @@ Grasp defaults to a gentle reminder, not a hard block. Try both:
 - [ ] With both a pending diff question (from normal Claude Code use) AND a pending scan question at the same time: run `grasp review` and confirm you only see the diff question, plus a one-line hint near the end pointing at `grasp scan` for the rest. Then run `grasp scan` and confirm the reverse — only the scan question, plus a hint pointing back at `grasp review`.
 - [ ] **The concept-memoization check that matters most:** answer a concept question for real via a normal Claude Code diff review, note the concept. Then run `grasp scan` until it would plausibly hit that same concept in an existing file — confirm it does NOT ask the concept question again (instance-only). Then do the reverse: master a concept via `grasp scan` first, and confirm your next real diff review skips re-teaching it too.
 - [ ] Confirm `grasp set mode --easy` (or `--hard`) visibly affects which concepts `grasp scan` favors, the same way it does for diff questions.
-- [ ] Try scanning a repo (or a file within one) that has a large file (2000+ lines) or a binary-ish file committed. Confirm both are silently skipped (marked scanned, no judge call, no crash) rather than blowing up or producing a nonsense question.
 - [ ] Confirm Ctrl+C during a `grasp scan` review is safe — anything not yet answered stays pending for next time, same as `grasp review`.
 - [ ] Confirm untracked/uncommitted files are never included in a scan — only `git ls-files`-tracked files should ever get a question.
+
+### Chunking for large files
+
+- [ ] Find or create a genuinely large tracked file (a few thousand lines or more). Run `grasp scan` against a repo containing it and confirm it can produce MORE THAN ONE question about that single file across one or more runs — not the old "one shot, forever" per-file limit. Each instance question's cited excerpt should show the file's real, absolute line numbers (e.g. a question about the file's later half should cite line numbers well past 1, not restart at 1).
+- [ ] With a large multi-section file alongside several small files in the same repo, watch (or check `grasp review`'s ordering/timestamps for) the order questions get generated in. Confirm the large file's sections are NOT all processed back-to-back before anything else — you should see other files' questions interleaved between the large file's own sections, one section advanced per pass through the round-robin order.
+- [ ] Run `grasp scan` again after answering some (but not all) sections of a large file. Confirm it resumes from the next unscanned section of that file, not from the beginning, and not skipping the file entirely just because it's already partly covered.
+- [ ] Try scanning a file that's binary-ish, or a genuinely enormous one (tens of thousands of lines — comfortably past the new, much larger defensive ceiling). Confirm both are skipped (marked scanned, no judge call, no crash), and confirm the oversized case specifically prints a visible message naming the file, its line count, and the ceiling (`"Skipped <path> — N lines, over the M-line processing ceiling."`) — not a silent skip.
+- [ ] If you have an old `~/.grasp/history.db` with real `grasp scan` history from before this build's chunking rework: run `grasp scan` once and confirm it doesn't error out and doesn't immediately re-ask about files you'd already fully scanned before — the schema migration should have expanded each old "fully scanned" file into all of its current chunks, already marked done.
 
 ## 7. What happens when things go wrong
 
@@ -143,7 +150,7 @@ At the end of this pass, answer honestly:
 
 - **`grasp scan` is a scope extension, not part of the original brief.** It reuses the diff side's storage, judge-call pattern, and review UI on purpose — worth knowing so its behavior is judged as its own feature, not as a bug in the original diff-comprehension design.
 - **`grasp scan` presents in one batch, not one-question-at-a-time.** It generates its whole run's worth of questions first, then hands the full batch to the same review UI — see §6b.
-- **`grasp scan` only sees tracked files, and never re-visits one once scanned.** It reads `git ls-files` (untracked/uncommitted files aren't included), and file-walk progress is permanent — no re-scan on edit. Run `grasp reset history` to start over.
+- **`grasp scan` only sees tracked files, and never re-visits a section once scanned.** It reads `git ls-files` (untracked/uncommitted files aren't included). Large files are split into ~400-line sections, each tracked and covered independently and resumably, but once a section is covered it's permanent — no re-scan on edit. Run `grasp reset history` to start over.
 - **Claude Code only.** No support for other AI coding tools yet.
 - **`grasp review` and `grasp scan` are both manual.** Nothing pops up on its own — you have to run the command yourself. `grasp scan` is inherently on-demand too — there's no background scanning.
 - **No answer grading.** Grasp never tells you if your answer was "right" — it never even sees your answer (nothing gets sent back to an LLM after you type it). It shows you a sample answer afterward, generated up front alongside the questions, so you can compare it against your own — that's for your own judgment, not a score from Grasp.

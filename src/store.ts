@@ -1,9 +1,11 @@
 import Database from "better-sqlite3";
 import * as fs from "fs";
+import * as path from "path";
 import { randomUUID } from "crypto";
 import { DB_PATH, GRASP_HOME } from "./paths";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
 import { ConceptTagGlobalRow, ConceptTagRecord, EventRecord, EventSource } from "./types";
+import { countChunksForLineCount } from "./scanChunking";
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS events (
@@ -160,19 +162,39 @@ const SCHEMA_SQL = `
     token TEXT NOT NULL
   );
 
-  -- \`grasp scan\`'s file-walk resumability: one row per (repo, file_path)
-  -- Grasp has ever looked at during a scan, permanently — no content hash or
-  -- mtime tracking, so an already-scanned file is never revisited even if
-  -- edited later (that's the diff-capture side's job). A second \`grasp
-  -- scan\` run continues from whatever isn't in this table yet. See
-  -- DECISIONS.md's "grasp scan: file-walk source, ordering, capping, and
-  -- resumability" entry.
+  -- \`grasp scan\`'s file-walk resumability, tracked at CHUNK granularity
+  -- (see DECISIONS.md's "grasp scan: chunking for large files" entry) — one
+  -- row per (repo, file_path, chunk_index) Grasp has ever looked at during a
+  -- scan, permanently — no content hash or mtime tracking, so an
+  -- already-covered chunk is never revisited even if the file is edited
+  -- later (that's the diff-capture side's job in general, and
+  -- \`scan_file_hashes\`'s whole-file-hash re-scan specifically once that's
+  -- built). \`is_final_chunk\` marks the row that completes a file's walk —
+  -- either the file's genuine last chunk (shorter than a full
+  -- MAX_SCAN_CHUNK_LINES, or the file's only chunk) or a mechanically-skipped
+  -- file's sole chunk_index=0 row (ignored/generated/binary/oversized — see
+  -- scan.ts's classifyFile) — so "is this file's walk complete" is a single
+  -- indexed lookup (\`EXISTS ... is_final_chunk = 1\`) that never needs to
+  -- re-read the file off disk to answer, for a file that's already fully
+  -- covered. A second \`grasp scan\` run continues from whatever chunk index
+  -- comes after the highest one already recorded for a file with no
+  -- is_final_chunk row yet.
   CREATE TABLE IF NOT EXISTS scan_progress (
     repo TEXT NOT NULL,
     file_path TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    is_final_chunk INTEGER NOT NULL DEFAULT 0,
     scanned_at TEXT NOT NULL,
-    PRIMARY KEY (repo, file_path)
+    PRIMARY KEY (repo, file_path, chunk_index)
   );
+
+  -- idx_scan_progress_final is NOT created here, same reason as
+  -- idx_events_session_id/idx_captured_diffs_pending above: on a
+  -- pre-chunking database scan_progress already exists without
+  -- chunk_index/is_final_chunk at this point (CREATE TABLE IF NOT EXISTS is
+  -- a no-op for it), so creating an index on those columns here would fail
+  -- before migrateSchema() gets a chance to add them. Created only inside
+  -- migrateSchema(), after the migration below runs.
 `;
 
 /**
@@ -251,6 +273,82 @@ function migrateSchema(db: Database.Database): void {
     // any other abandoned reservation. See tryClaimGenerationSlot/
     // releaseGenerationSlot's own comments for why ownership matters at all.
     db.exec(`ALTER TABLE generation_reservations ADD COLUMN token TEXT NOT NULL DEFAULT ''`);
+  }
+
+  migrateScanProgressToChunkGranularity(db);
+}
+
+/**
+ * Migrates a pre-chunking `scan_progress` table — one row per (repo,
+ * file_path), meaning "this file was already fully scanned" under the old
+ * whole-file model — to the chunk-granularity schema. See DECISIONS.md's
+ * "grasp scan: chunking for large files" entry for the open design point
+ * this resolves: each old row is expanded into every chunk the file
+ * CURRENTLY has on disk (not just chunk_index=0), so the schema change
+ * doesn't trigger stale reprocessing of a file that was already fully
+ * covered. SQLite can't add/change a PRIMARY KEY via ALTER TABLE, so this
+ * renames the old table aside, creates the new-shape table fresh (already
+ * covered by SCHEMA_SQL's own CREATE TABLE IF NOT EXISTS, but re-asserted
+ * here defensively in case this function is ever called out of order), and
+ * migrates rows across in one transaction.
+ */
+function migrateScanProgressToChunkGranularity(db: Database.Database): void {
+  const scanProgressColumns = db.prepare(`PRAGMA table_info(scan_progress)`).all() as Array<{ name: string }>;
+  const hasChunkIndex = scanProgressColumns.some((c) => c.name === "chunk_index");
+  if (!hasChunkIndex) {
+    const oldRows = db.prepare(`SELECT repo, file_path, scanned_at FROM scan_progress`).all() as Array<{
+      repo: string;
+      file_path: string;
+      scanned_at: string;
+    }>;
+
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE scan_progress RENAME TO scan_progress_pre_chunking`);
+      db.exec(`
+        CREATE TABLE scan_progress (
+          repo TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          chunk_index INTEGER NOT NULL,
+          is_final_chunk INTEGER NOT NULL DEFAULT 0,
+          scanned_at TEXT NOT NULL,
+          PRIMARY KEY (repo, file_path, chunk_index)
+        )
+      `);
+      const insert = db.prepare(
+        `INSERT INTO scan_progress (repo, file_path, chunk_index, is_final_chunk, scanned_at) VALUES (?, ?, ?, ?, ?)`
+      );
+      for (const row of oldRows) {
+        const chunkCount = countCurrentChunkCountForMigration(row.repo, row.file_path);
+        for (let i = 0; i < chunkCount; i++) {
+          insert.run(row.repo, row.file_path, i, i === chunkCount - 1 ? 1 : 0, row.scanned_at);
+        }
+      }
+      db.exec(`DROP TABLE scan_progress_pre_chunking`);
+    });
+    migrate();
+  }
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_scan_progress_final ON scan_progress(repo, file_path, is_final_chunk)`);
+}
+
+/**
+ * Reads a migrated file's CURRENT on-disk line count to compute how many
+ * chunks it now has — "given its current on-disk size," per the migration's
+ * own requirement, not the size it happened to be when originally scanned.
+ * Falls back to 1 (a single, already-final chunk) when the file can't be
+ * read at all (deleted, moved, or — since this DB is global across every
+ * repo Grasp has ever touched, not just ones present on this machine right
+ * now — a repo that simply isn't checked out here): the safe, minimal
+ * default that still satisfies "don't trigger stale reprocessing" without
+ * needing real content to reason about.
+ */
+function countCurrentChunkCountForMigration(repo: string, filePath: string): number {
+  try {
+    const content = fs.readFileSync(path.join(repo, filePath), "utf-8");
+    const lineCount = content.split(/\r\n|\r|\n/).length;
+    return countChunksForLineCount(lineCount);
+  } catch {
+    return 1;
   }
 }
 
@@ -1090,27 +1188,54 @@ export function clearHistory(db: Database.Database): { events: number; conceptTa
   return counts;
 }
 
-// --- grasp scan: file-walk resumability -------------------------------------
+// --- grasp scan: file-walk resumability, at chunk granularity ---------------
 
 /**
- * Every file path already recorded as scanned for `repo`, as a `Set` for
- * cheap membership checks against a potentially large tracked-file list.
- * Permanent — see `scan_progress`'s own schema comment for why there's no
- * hash/mtime invalidation.
+ * Every file path whose walk is COMPLETE for `repo` — i.e. has a recorded
+ * `is_final_chunk` row — as a `Set` for cheap membership checks against a
+ * potentially large tracked-file list. A single indexed query, no disk
+ * reads: a file that's already fully covered never needs to be re-read just
+ * to confirm it's done. Permanent — see `scan_progress`'s own schema
+ * comment for why there's no hash/mtime invalidation.
  */
-export function getScannedFilePaths(db: Database.Database, repo: string): Set<string> {
-  const rows = db.prepare(`SELECT file_path FROM scan_progress WHERE repo = ?`).all(repo) as Array<{
-    file_path: string;
-  }>;
+export function getScanCompletedFilePaths(db: Database.Database, repo: string): Set<string> {
+  const rows = db
+    .prepare(`SELECT file_path FROM scan_progress WHERE repo = ? AND is_final_chunk = 1`)
+    .all(repo) as Array<{ file_path: string }>;
   return new Set(rows.map((r) => r.file_path));
 }
 
-/** Marks one file scanned for `repo` — idempotent (a re-scan attempt, which shouldn't happen given the resumability filtering, would just no-op rather than error). */
-export function markFileScanned(db: Database.Database, repo: string, filePath: string): void {
+/**
+ * Every chunk index already recorded for (repo, filePath) — used to resume a
+ * partially-covered multi-chunk file from the right chunk, and to detect
+ * (via the caller) whether the file's walk is already complete without a
+ * second, separate query.
+ */
+export function getScannedChunkIndexes(db: Database.Database, repo: string, filePath: string): Set<number> {
+  const rows = db
+    .prepare(`SELECT chunk_index FROM scan_progress WHERE repo = ? AND file_path = ?`)
+    .all(repo, filePath) as Array<{ chunk_index: number }>;
+  return new Set(rows.map((r) => r.chunk_index));
+}
+
+/**
+ * Marks one chunk scanned for `repo`/`filePath` — idempotent (a re-scan
+ * attempt, which shouldn't happen given the resumability filtering, would
+ * just no-op rather than error). `isFinal` marks the row that completes the
+ * file's walk (see this table's own schema comment) — the file's genuine
+ * last chunk, or a mechanically-skipped file's sole chunk_index=0 row.
+ */
+export function markChunkScanned(
+  db: Database.Database,
+  repo: string,
+  filePath: string,
+  chunkIndex: number,
+  isFinal: boolean
+): void {
   db.prepare(
-    `INSERT INTO scan_progress (repo, file_path, scanned_at) VALUES (?, ?, ?)
-     ON CONFLICT(repo, file_path) DO UPDATE SET scanned_at = excluded.scanned_at`
-  ).run(repo, filePath, new Date().toISOString());
+    `INSERT INTO scan_progress (repo, file_path, chunk_index, is_final_chunk, scanned_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(repo, file_path, chunk_index) DO UPDATE SET is_final_chunk = excluded.is_final_chunk, scanned_at = excluded.scanned_at`
+  ).run(repo, filePath, chunkIndex, isFinal ? 1 : 0, new Date().toISOString());
 }
 
 export function countHookInvocations(

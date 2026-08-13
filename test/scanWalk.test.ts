@@ -5,24 +5,25 @@ import * as os from "os";
 import * as path from "path";
 import { execFileSync } from "child_process";
 import { orderFilesRoundRobin, runScanWalk } from "../src/scan";
+import { MAX_SCAN_CHUNK_LINES } from "../src/scanChunking";
 import {
   clearHistory,
   getAllAnsweredConceptTags,
   getConceptTagGlobal,
-  getScannedFilePaths,
+  getScanCompletedFilePaths,
   insertEvent,
   openStore,
 } from "../src/store";
 import { testConfig } from "./helpers";
 
 /**
- * Headless tests for `grasp scan`'s file-walk logic — ordering, capping,
- * resumability, the mechanical ignore/generated-file/binary/oversized
- * skips, and the shared-memoization hard requirement — all exercised
- * directly against `runScanWalk`/`orderFilesRoundRobin`, without going
- * through the interactive review UI (which needs a real pty — see
- * scanPty.test.ts for that layer). See DECISIONS.md's `grasp scan` entries
- * for the design this verifies.
+ * Headless tests for `grasp scan`'s file-walk logic — chunk-granularity
+ * ordering, capping, resumability, the mechanical ignore/generated-file/
+ * binary/oversized skips, and the shared-memoization hard requirement — all
+ * exercised directly against `runScanWalk`/`orderFilesRoundRobin`, without
+ * going through the interactive review UI (which needs a real pty — see
+ * scanPty.test.ts for that layer). See DECISIONS.md's `grasp scan: chunking
+ * for large files` entry for the design this verifies.
  */
 
 const FIXTURE_CLAUDE_DIR = path.resolve(process.cwd(), "test/fixtures/mock-claude");
@@ -91,6 +92,12 @@ function tempDbPath(): string {
   return path.join(mkTempDir("grasp-test-scan-db-"), "history.db");
 }
 
+function linesFile(n: number): string {
+  const lines: string[] = [];
+  for (let i = 1; i <= n; i++) lines.push(`// line ${i}`);
+  return lines.join("\n") + "\n";
+}
+
 // --- orderFilesRoundRobin: pure ordering logic ------------------------------
 
 test("orderFilesRoundRobin: interleaves across top-level directories instead of exhausting one first", () => {
@@ -118,15 +125,14 @@ test("orderFilesRoundRobin: every input path appears exactly once in the output,
 
 test("runScanWalk: a capped run stops partway and actually spreads coverage across more than one top-level directory", () => {
   // "normal" mode always produces a "both" question (fresh concept tag per
-  // call) — 2 real questions per file, not 1. With scanQuestionsCap=3, the
-  // cap is checked before each file (see DECISIONS.md's "question caps
-  // count real questions, not event-rows" entry): file 1 (count 0 < 3)
-  // proceeds and pushes the count to 2; file 2 (2 < 3) is still attempted
-  // and pushes the count to 4 — a legitimate 1-question overshoot, accepted
-  // as a final state under "check before generating, not after"; file 3
-  // (4 >= 3) is blocked before any judge call. So exactly 2 files get
-  // scanned here, not 3 — one fewer than a naive per-file-row count would
-  // suggest, and the actual, corrected proof that the cap counts questions.
+  // call) — 2 real questions per chunk, not 1. With scanQuestionsCap=3, the
+  // cap is checked before each chunk (see DECISIONS.md's "question caps
+  // count real questions, not event-rows" entry): file 1's sole chunk
+  // (count 0 < 3) proceeds and pushes the count to 2; file 2's sole chunk
+  // (2 < 3) is still attempted and pushes the count to 4 — a legitimate
+  // 1-question overshoot, accepted as a final state under "check before
+  // generating, not after"; file 3 (4 >= 3) is blocked before any judge
+  // call. So exactly 2 files get fully covered here, not 3.
   const repo = initFixtureRepo();
   const db = openStore(tempDbPath());
   const config = testConfig({ scanQuestionsCap: 3 });
@@ -138,13 +144,13 @@ test("runScanWalk: a capped run stops partway and actually spreads coverage acro
     assert.equal(result.capped, true, "the walk must stop once the cap is hit, not exhaust the whole list");
   });
 
-  const scanned = getScannedFilePaths(db, repo);
+  const completed = getScanCompletedFilePaths(db, repo);
   assert.equal(
-    scanned.size,
+    completed.size,
     2,
-    "exactly 2 files should be marked scanned — 2 'both' questions each, hitting the cap of 3 with a 1-question overshoot"
+    "exactly 2 files should be fully covered — 2 'both' questions each, hitting the cap of 3 with a 1-question overshoot"
   );
-  const dirsCovered = new Set([...scanned].map((p) => p.split("/")[0]));
+  const dirsCovered = new Set([...completed].map((p) => p.split("/")[0]));
   assert.ok(dirsCovered.size > 1, `expected coverage across more than one top-level directory, got only: ${[...dirsCovered]}`);
   db.close();
 });
@@ -160,10 +166,11 @@ test("runScanWalk: full=true bypasses the cap entirely, walking every file regar
   withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
     const result = runScanWalk(db, repo, "scan-full-test", config, orderFilesRoundRobin(files), true);
     assert.equal(result.capped, false);
-    assert.equal(result.filesWalked, files.length);
+    assert.equal(result.filesTouched, files.length);
+    assert.equal(result.chunksProcessed, files.length, "every file here is small — one chunk each");
   });
 
-  assert.equal(getScannedFilePaths(db, repo).size, files.length);
+  assert.equal(getScanCompletedFilePaths(db, repo).size, files.length);
   db.close();
 });
 
@@ -176,19 +183,19 @@ test("runScanWalk: a second run resumes from unscanned files, never re-asking ab
   withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
     runScanWalk(db1, repo, "scan-run-1", testConfig({ scanQuestionsCap: 1 }), orderFilesRoundRobin(allSourceFiles), false);
   });
-  const scannedAfterRun1 = getScannedFilePaths(db1, repo);
-  assert.equal(scannedAfterRun1.size, 1);
+  const completedAfterRun1 = getScanCompletedFilePaths(db1, repo);
+  assert.equal(completedAfterRun1.size, 1);
   db1.close();
 
   const db2 = openStore(dbPath);
-  const unscanned = allSourceFiles.filter((f) => !getScannedFilePaths(db2, repo).has(f));
+  const unscanned = allSourceFiles.filter((f) => !getScanCompletedFilePaths(db2, repo).has(f));
   assert.equal(unscanned.length, 2, "the resumed run must see exactly the files the first run didn't cover");
   withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
     const result = runScanWalk(db2, repo, "scan-run-2", testConfig({ scanQuestionsCap: 999 }), orderFilesRoundRobin(unscanned), false);
-    assert.equal(result.filesWalked, 2);
+    assert.equal(result.filesTouched, 2);
   });
-  const scannedAfterRun2 = getScannedFilePaths(db2, repo);
-  assert.equal(scannedAfterRun2.size, 3, "all 3 files scanned across the two runs combined");
+  const completedAfterRun2 = getScanCompletedFilePaths(db2, repo);
+  assert.equal(completedAfterRun2.size, 3, "all 3 files scanned across the two runs combined");
 
   const events = db2.prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id IN ('scan-run-1', 'scan-run-2') AND question_type IS NOT NULL`).get() as { n: number };
   assert.equal(events.n, 3, "3 distinct real questions total, one per file, none re-asked");
@@ -205,11 +212,12 @@ test("runScanWalk: ignore patterns and generated-file detection skip files witho
   // outright (no such binary), which would surface as an "error" miss row
   // instead of the two files being silently marked scanned with zero rows.
   const result = runScanWalk(db, repo, "scan-ignore-test", config, ["alpha/package-lock.json", "beta/generated.ts"], false);
-  assert.equal(result.filesWalked, 2);
+  assert.equal(result.filesTouched, 2);
+  assert.equal(result.chunksProcessed, 0, "mechanically-skipped files never reach a real generation call");
 
-  const scanned = getScannedFilePaths(db, repo);
-  assert.ok(scanned.has("alpha/package-lock.json"));
-  assert.ok(scanned.has("beta/generated.ts"));
+  const completed = getScanCompletedFilePaths(db, repo);
+  assert.ok(completed.has("alpha/package-lock.json"));
+  assert.ok(completed.has("beta/generated.ts"));
 
   const eventCount = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
   assert.equal(eventCount, 0, "neither file should have produced any events row — both were mechanically skipped");
@@ -224,7 +232,7 @@ test("runScanWalk: a binary file is skipped (marked scanned, no judge call)", ()
 
   runScanWalk(db, repo, "scan-binary-test", config, ["binary.dat"], false);
 
-  assert.ok(getScannedFilePaths(db, repo).has("binary.dat"));
+  assert.ok(getScanCompletedFilePaths(db, repo).has("binary.dat"));
   const eventCount = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
   assert.equal(eventCount, 0);
   db.close();
@@ -239,10 +247,174 @@ test("runScanWalk: a failed judge call (error) leaves the file unscanned for ret
     runScanWalk(db, repo, "scan-fail-test", config, ["alpha/one.ts"], false);
   });
 
-  assert.equal(getScannedFilePaths(db, repo).has("alpha/one.ts"), false, "a failed attempt must not be marked scanned");
+  assert.equal(getScanCompletedFilePaths(db, repo).has("alpha/one.ts"), false, "a failed attempt must not be marked scanned");
   const missRow = db.prepare(`SELECT miss_reason, source FROM events WHERE session_id = 'scan-fail-test'`).get() as any;
   assert.equal(missRow.miss_reason, "error");
   assert.equal(missRow.source, "scan");
+  db.close();
+});
+
+// --- Prompt 8: chunking for large files -------------------------------------
+
+test("runScanWalk: a file over the chunk threshold splits into multiple real questions, each chunk's excerpt using absolute (not chunk-relative) line numbers", () => {
+  const repo = initFixtureRepo();
+  fs.writeFileSync(path.join(repo, "big.ts"), linesFile(MAX_SCAN_CHUNK_LINES + 50));
+  const db = openStore(tempDbPath());
+  const config = testConfig({ scanQuestionsCap: 999 });
+
+  // A tiny custom mock: reports back the FIRST absolute line number it's
+  // shown (parsed straight out of the prompt's own line-numbered content),
+  // proving by construction that a chunk other than the first produces a
+  // citation in the FILE's real numbering, not restarting at 1.
+  const mockDir = mkTempDir("grasp-test-scan-chunk-mock-");
+  fs.writeFileSync(
+    path.join(mockDir, "claude"),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1];
+const lineMatch = prompt.match(/(\\d+)\\|/);
+const firstLine = lineMatch ? parseInt(lineMatch[1], 10) : 1;
+const result = {
+  worthAsking: true,
+  conceptTag: "chunk-concept-" + firstLine,
+  questionConcept: "concept question for the chunk starting at " + firstLine,
+  questionInstance: "instance question about the chunk starting at " + firstLine,
+  sampleAnswerConcept: "sample concept answer",
+  sampleAnswerInstance: "sample instance answer",
+  conceptExplanation: "explanation",
+  citedLineStart: firstLine,
+  citedLineEnd: firstLine + 1
+};
+process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.stringify(result), is_error: false }));
+`,
+    { mode: 0o755 }
+  );
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${mockDir}:${originalPath}`;
+  let result: ReturnType<typeof runScanWalk>;
+  try {
+    result = runScanWalk(db, repo, "scan-chunk-test", config, ["big.ts"], false);
+  } finally {
+    process.env.PATH = originalPath;
+  }
+
+  assert.equal(result!.chunksProcessed, 2, "a file of MAX_SCAN_CHUNK_LINES + 50 lines must split into exactly 2 chunks");
+  assert.ok(getScanCompletedFilePaths(db, repo).has("big.ts"), "the file's walk must be complete once both chunks are covered");
+
+  const rows = db
+    .prepare(`SELECT scan_excerpt_start_line, scan_excerpt_end_line FROM events WHERE session_id = 'scan-chunk-test' AND question_type IS NOT NULL ORDER BY id ASC`)
+    .all() as Array<{ scan_excerpt_start_line: number; scan_excerpt_end_line: number }>;
+  assert.equal(rows.length, 2, "each chunk must produce its own real question");
+  assert.equal(rows[0].scan_excerpt_start_line, 1, "chunk 0's citation must start at the file's real line 1");
+  assert.equal(
+    rows[1].scan_excerpt_start_line,
+    MAX_SCAN_CHUNK_LINES + 1,
+    "chunk 1's citation must use the FILE's absolute line number, not restart at 1"
+  );
+  db.close();
+});
+
+test("runScanWalk: a large multi-chunk file genuinely interleaves with small single-chunk files across passes, not one contiguous block", () => {
+  const repo = mkTempDir("grasp-test-scan-interleave-repo-");
+  git(repo, ["init", "-q"]);
+  git(repo, ["config", "user.email", "test@example.com"]);
+  git(repo, ["config", "user.name", "Test"]);
+  const write = (rel: string, content: string) => {
+    const full = path.join(repo, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  };
+  // 3 chunks: lines 1-400, 401-800, 801-900.
+  write("big/file.ts", linesFile(2 * MAX_SCAN_CHUNK_LINES + 100));
+  write("small1/a.ts", "// small file a\n");
+  write("small2/b.ts", "// small file b\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-q", "-m", "initial"]);
+
+  const orderLogPath = path.join(mkTempDir("grasp-test-scan-order-log-"), "order.log");
+  fs.writeFileSync(orderLogPath, "");
+  const mockDir = mkTempDir("grasp-test-scan-order-mock-");
+  fs.writeFileSync(
+    path.join(mockDir, "claude"),
+    `#!/usr/bin/env node
+const fs = require("fs");
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf("-p") + 1];
+const fileMatch = prompt.match(/^File: (.+)$/m);
+const lineMatch = prompt.match(/(\\d+)\\|/);
+fs.appendFileSync(process.env.GRASP_TEST_ORDER_LOG, fileMatch[1] + ":" + lineMatch[1] + "\\n");
+const tag = ("chunk-" + fileMatch[1] + "-" + lineMatch[1]).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const result = {
+  worthAsking: true,
+  conceptTag: tag,
+  questionConcept: "concept q",
+  questionInstance: "instance q",
+  sampleAnswerConcept: "sample concept",
+  sampleAnswerInstance: "sample instance",
+  conceptExplanation: "explanation",
+  citedLineStart: parseInt(lineMatch[1], 10),
+  citedLineEnd: parseInt(lineMatch[1], 10) + 1
+};
+process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.stringify(result), is_error: false }));
+`,
+    { mode: 0o755 }
+  );
+
+  const db = openStore(tempDbPath());
+  // Cap of 8: pass 1 covers big/chunk0 (0->2), small1 (2->4), small2 (4->6);
+  // pass 2's first check (6<8) lets big/chunk1 through (6->8); the next
+  // check (8>=8) then caps the walk before small1/small2 are re-visited
+  // (already done) or big/chunk2 is reached.
+  const config = testConfig({ scanQuestionsCap: 8 });
+  const ordered = orderFilesRoundRobin(["big/file.ts", "small1/a.ts", "small2/b.ts"]);
+
+  const originalPath = process.env.PATH;
+  const originalOrderLog = process.env.GRASP_TEST_ORDER_LOG;
+  process.env.PATH = `${mockDir}:${originalPath}`;
+  process.env.GRASP_TEST_ORDER_LOG = orderLogPath;
+  let result: ReturnType<typeof runScanWalk>;
+  try {
+    result = runScanWalk(db, repo, "scan-interleave-test", config, ordered, false);
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalOrderLog === undefined) delete process.env.GRASP_TEST_ORDER_LOG;
+    else process.env.GRASP_TEST_ORDER_LOG = originalOrderLog;
+  }
+  assert.equal(result!.capped, true);
+
+  const log = fs
+    .readFileSync(orderLogPath, "utf-8")
+    .trim()
+    .split("\n")
+    .filter((l) => l.length > 0);
+  assert.deepEqual(
+    log,
+    ["big/file.ts:1", "small1/a.ts:1", "small2/b.ts:1", "big/file.ts:401"],
+    "big/file.ts's second chunk must be preceded by BOTH small files' calls, not immediately follow its own first chunk"
+  );
+  db.close();
+});
+
+test("runScanWalk: a file over the new defensive processing ceiling is skipped with a visible message, marked fully scanned", () => {
+  const repo = initFixtureRepo();
+  // Import the ceiling indirectly via a file we know is well over it —
+  // scan.ts's own MAX_SCAN_CEILING_LINES is intentionally not exported (an
+  // internal implementation constant), so this constructs a file guaranteed
+  // to exceed any reasonable ceiling instead of importing the exact number.
+  fs.writeFileSync(path.join(repo, "huge.ts"), linesFile(25_000));
+  const db = openStore(tempDbPath());
+  const config = testConfig({ scanQuestionsCap: 999 });
+
+  // No mock claude on PATH — an oversized file must never reach a judge call.
+  const result = runScanWalk(db, repo, "scan-oversized-test", config, ["huge.ts"], false);
+
+  assert.equal(result.oversizedSkips.length, 1);
+  assert.equal(result.oversizedSkips[0].filePath, "huge.ts");
+  assert.equal(result.oversizedSkips[0].lineCount, 25_001, "linesFile appends a trailing newline, so split() reports one extra empty final line");
+  assert.ok(getScanCompletedFilePaths(db, repo).has("huge.ts"), "an oversized file must still be marked fully scanned, same permanence as other skip categories");
+  const eventCount = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
+  assert.equal(eventCount, 0);
   db.close();
 });
 
@@ -362,10 +534,10 @@ test("clearHistory: also wipes scan_progress, so a reset repo can be scanned fro
   withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
     runScanWalk(db, repo, "scan-reset-test", testConfig({ scanQuestionsCap: 999 }), ["alpha/one.ts"], false);
   });
-  assert.ok(getScannedFilePaths(db, repo).size > 0);
+  assert.ok(getScanCompletedFilePaths(db, repo).size > 0);
 
   const deleted = clearHistory(db);
   assert.ok(deleted.scanProgress >= 1);
-  assert.equal(getScannedFilePaths(db, repo).size, 0, "scan progress must be fully cleared by reset history");
+  assert.equal(getScanCompletedFilePaths(db, repo).size, 0, "scan progress must be fully cleared by reset history");
   db.close();
 });
