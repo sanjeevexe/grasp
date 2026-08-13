@@ -8,6 +8,7 @@ import {
   GENERATION_RESERVATION_STALE_MS,
   getBlockingPendingQuestionsForSession,
   getPendingQuestionsForSession,
+  getSessionQuestionCount,
   insertEvent,
   openStore,
   releaseGenerationSlot,
@@ -55,6 +56,81 @@ test("getPendingQuestionsForSession: counts a question regardless of how old it 
   const db = openStore(tempDbPath());
   seedPendingQuestion(db, "resumed-session", "2000-01-01T00:00:00.000Z");
   assert.equal(getPendingQuestionsForSession(db, "resumed-session").length, 1);
+  db.close();
+});
+
+// getSessionQuestionCount counts real, individual questions — not event
+// rows. One event can carry ONE real question (question_type "instance",
+// question_concept NULL — the concept was already memoized) or TWO
+// (question_type "both", both question_concept and question_instance set).
+// Before this fix, a cap of N could silently admit up to 2N actual
+// questions since the cap checked row count, not question count — see
+// DECISIONS.md's "question caps count real questions, not event-rows"
+// entry.
+test("getSessionQuestionCount: a 'both' event counts as 2, an 'instance'-only event counts as 1, a miss (question_type NULL) counts as 0", () => {
+  const db = openStore(tempDbPath());
+  const sessionId = "mixed-session";
+
+  insertEvent(db, {
+    timestamp: "2020-01-01T00:00:00.000Z",
+    repo: "/tmp/test-repo",
+    sessionId,
+    diffHash: null,
+    diffSummary: "1 file changed",
+    questionConcept: "concept question",
+    questionInstance: "instance question",
+    questionType: "both",
+    generationSource: "test-seed",
+    missReason: null,
+    answerConcept: null,
+    answerInstance: null,
+    skipped: false,
+    skipReason: null,
+    costUsd: 0.001,
+    diffFiles: null,
+  });
+
+  insertEvent(db, {
+    timestamp: "2020-01-01T00:01:00.000Z",
+    repo: "/tmp/test-repo",
+    sessionId,
+    diffHash: null,
+    diffSummary: "1 file changed",
+    questionConcept: null,
+    questionInstance: "instance question only",
+    questionType: "instance",
+    generationSource: "test-seed",
+    missReason: null,
+    answerConcept: null,
+    answerInstance: null,
+    skipped: false,
+    skipReason: null,
+    costUsd: 0.001,
+    diffFiles: null,
+  });
+
+  // A miss (no question at all) must contribute 0, not be miscounted.
+  insertEvent(db, {
+    timestamp: "2020-01-01T00:02:00.000Z",
+    repo: "/tmp/test-repo",
+    sessionId,
+    diffHash: null,
+    diffSummary: "1 file changed",
+    questionConcept: null,
+    questionInstance: null,
+    questionType: null,
+    generationSource: "test-seed",
+    missReason: "error",
+    answerConcept: null,
+    answerInstance: null,
+    skipped: false,
+    skipReason: null,
+    costUsd: 0.001,
+    diffFiles: null,
+  });
+
+  // 2 (both) + 1 (instance-only) + 0 (miss) = 3 real questions across 3 event rows.
+  assert.equal(getSessionQuestionCount(db, sessionId), 3);
   db.close();
 });
 

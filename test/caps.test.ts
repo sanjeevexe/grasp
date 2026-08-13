@@ -65,10 +65,18 @@ function baseParams(overrides: Partial<GenerationParams> = {}): GenerationParams
   };
 }
 
-test("runGeneration: questions-per-session cap stops generation after N real questions", () => {
+test("runGeneration: questions-per-session cap stops generation after N real questions (counting individual questions, not event rows)", () => {
+  // "normal" mode always returns a fresh, never-before-seen concept tag, so
+  // every call produces a "both" event — 2 real questions per call, not 1.
+  // See DECISIONS.md's "question caps count real questions, not event-rows"
+  // entry: with a cap of 3, call 1 (0 -> 2) stays under the cap, call 2 is
+  // still attempted (2 < 3) and pushes the count to 4 — a legitimate
+  // overshoot of 1, accepted as a final state under the "check before
+  // generating, not after" rule — and call 3 (4 >= 3) is blocked before
+  // invoking claude at all.
   const db = openStore(tempDbPath());
   const counter = tempCounterPath();
-  const config = testConfig({ questionsPerSessionCap: 2 });
+  const config = testConfig({ questionsPerSessionCap: 3 });
   const params = baseParams({ config });
 
   withMockClaude(
@@ -78,17 +86,87 @@ test("runGeneration: questions-per-session cap stops generation after N real que
       const r2 = runGeneration(db, params);
       const r3 = runGeneration(db, params);
       assert.equal(r1.missReason, null);
-      assert.equal(r2.missReason, null);
+      assert.equal(r1.questionType, "both");
+      assert.equal(r2.missReason, null, "call 2 must still be attempted — 2 questions so far is under the cap of 3");
+      assert.equal(r2.questionType, "both");
       assert.equal(r3.missReason, "cap_reached", "call 3: the cap must block before invoking claude at all");
     }
   );
 
-  assert.equal(getSessionQuestionCount(db, "test-session"), 2);
+  assert.equal(
+    getSessionQuestionCount(db, "test-session"),
+    4,
+    "2 'both' events = 4 real questions, one more than the cap of 3 — the accepted, at-most-1-question overshoot"
+  );
   assert.equal(
     fs.readFileSync(counter, "utf-8"),
     "2",
     "the cap-blocked call must never have invoked claude — the mock must only have run twice"
   );
+  db.close();
+});
+
+test("runGeneration: a mix of 'both' and 'instance'-only outcomes — the cap counts sub-questions across both shapes, not event rows", () => {
+  // Pre-seed 'brand-new-concept' as already answered so the
+  // "brand-new-concept-no-question" mock mode's instance-only response
+  // (questionConcept: null) is accepted rather than rejected as a
+  // concept-first contract violation.
+  const db = openStore(tempDbPath());
+  db.exec(`
+    INSERT INTO events (timestamp, repo, session_id, question_type, generation_source)
+    VALUES ('2020-01-01T00:00:00.000Z', '/tmp/test-repo', 'prior-session', 'both', 'test-seed');
+  `);
+  const priorEventId = db.prepare(`SELECT id FROM events WHERE session_id = 'prior-session'`).get() as {
+    id: number;
+  };
+  db.prepare(`INSERT INTO concept_tags (event_id, tag, answered) VALUES (?, 'brand-new-concept', 1)`).run(
+    priorEventId.id
+  );
+
+  const config = testConfig({ questionsPerSessionCap: 4 });
+  const params = baseParams({ config });
+
+  // Call 1: "both" (fresh concept tag) -> 2 questions. Running total: 2.
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
+    const r1 = runGeneration(db, params);
+    assert.equal(r1.missReason, null);
+    assert.equal(r1.questionType, "both");
+  });
+  assert.equal(getSessionQuestionCount(db, "test-session"), 2);
+
+  // Call 2: "brand-new-concept-no-question" (already-memoized tag) ->
+  // instance-only, 1 question. Running total: 3, still under the cap of 4.
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
+    const r2 = runGeneration(db, params);
+    assert.equal(r2.missReason, null);
+    assert.equal(r2.questionType, "instance");
+  });
+  assert.equal(
+    getSessionQuestionCount(db, "test-session"),
+    3,
+    "1 'both' event (2 questions) + 1 instance-only event (1 question) = 3, not 2 rows"
+  );
+
+  // Call 3: still under the cap (3 < 4), so it's attempted — another
+  // instance-only question pushes the total to 4, an exact, non-overshooting
+  // final state.
+  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
+    const r3 = runGeneration(db, params);
+    assert.equal(r3.missReason, null);
+  });
+  assert.equal(getSessionQuestionCount(db, "test-session"), 4);
+
+  // Call 4: cap is now met (4 >= 4) — blocked before invoking claude.
+  const counter = tempCounterPath();
+  withMockClaude(
+    { GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question", GRASP_TEST_MOCK_COUNTER: counter },
+    () => {
+      const r4 = runGeneration(db, params);
+      assert.equal(r4.missReason, "cap_reached");
+    }
+  );
+  assert.ok(!fs.existsSync(counter), "claude must never have been invoked once the cap was already met");
+
   db.close();
 });
 

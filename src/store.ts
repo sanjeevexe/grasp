@@ -705,17 +705,30 @@ export function getSessionCostUsd(db: Database.Database, sessionId: string): num
 }
 
 /**
- * Counts real (non-miss) questions — `question_type IS NOT NULL` — for one
- * Claude Code `session_id`, across every turn sharing it. This is the
- * questions-per-session cap's accounting boundary (Phase 8): session-wide,
- * the same boundary `getSessionCostUsd` already uses for the cost cap, per
- * DECISIONS.md's "Resolving Phase 3's flagged consequence" entry — a
- * per-turn cap would let a long multi-turn session generate a fresh batch
- * on every turn, defeating the cap's purpose.
+ * Counts real, individual questions — not event rows — for one Claude Code
+ * `session_id`, across every turn sharing it. A real (non-miss,
+ * `question_type IS NOT NULL`) event carries ONE question when only
+ * `question_instance` is set (the concept was already memoized) or TWO when
+ * both `question_concept` and `question_instance` are set (a "both" pair) —
+ * see DECISIONS.md's "question caps count real questions, not event-rows"
+ * entry for why counting rows instead let a cap of N silently admit up to
+ * 2N actual questions. This is the questions-per-session cap's accounting
+ * boundary (Phase 8): session-wide, the same boundary `getSessionCostUsd`
+ * already uses for the cost cap, per DECISIONS.md's "Resolving Phase 3's
+ * flagged consequence" entry — a per-turn cap would let a long multi-turn
+ * session generate a fresh batch on every turn, defeating the cap's
+ * purpose.
  */
 export function getSessionQuestionCount(db: Database.Database, sessionId: string): number {
   const row = db
-    .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id = ? AND question_type IS NOT NULL`)
+    .prepare(
+      `SELECT COALESCE(SUM(
+         (CASE WHEN question_concept IS NOT NULL THEN 1 ELSE 0 END) +
+         (CASE WHEN question_instance IS NOT NULL THEN 1 ELSE 0 END)
+       ), 0) AS n
+       FROM events
+       WHERE session_id = ? AND question_type IS NOT NULL`
+    )
     .get(sessionId) as { n: number };
   return row.n;
 }

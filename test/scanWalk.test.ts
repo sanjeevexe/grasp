@@ -117,6 +117,16 @@ test("orderFilesRoundRobin: every input path appears exactly once in the output,
 // --- runScanWalk: capping, ordering-in-practice, resumability --------------
 
 test("runScanWalk: a capped run stops partway and actually spreads coverage across more than one top-level directory", () => {
+  // "normal" mode always produces a "both" question (fresh concept tag per
+  // call) — 2 real questions per file, not 1. With scanQuestionsCap=3, the
+  // cap is checked before each file (see DECISIONS.md's "question caps
+  // count real questions, not event-rows" entry): file 1 (count 0 < 3)
+  // proceeds and pushes the count to 2; file 2 (2 < 3) is still attempted
+  // and pushes the count to 4 — a legitimate 1-question overshoot, accepted
+  // as a final state under "check before generating, not after"; file 3
+  // (4 >= 3) is blocked before any judge call. So exactly 2 files get
+  // scanned here, not 3 — one fewer than a naive per-file-row count would
+  // suggest, and the actual, corrected proof that the cap counts questions.
   const repo = initFixtureRepo();
   const db = openStore(tempDbPath());
   const config = testConfig({ scanQuestionsCap: 3 });
@@ -129,7 +139,11 @@ test("runScanWalk: a capped run stops partway and actually spreads coverage acro
   });
 
   const scanned = getScannedFilePaths(db, repo);
-  assert.equal(scanned.size, 3, "exactly 3 files should be marked scanned — one per real question up to the cap");
+  assert.equal(
+    scanned.size,
+    2,
+    "exactly 2 files should be marked scanned — 2 'both' questions each, hitting the cap of 3 with a 1-question overshoot"
+  );
   const dirsCovered = new Set([...scanned].map((p) => p.split("/")[0]));
   assert.ok(dirsCovered.size > 1, `expected coverage across more than one top-level directory, got only: ${[...dirsCovered]}`);
   db.close();
