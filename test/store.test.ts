@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import Database from "better-sqlite3";
 import {
   GENERATION_RESERVATION_STALE_MS,
   getBlockingPendingQuestionsForSession,
@@ -139,5 +140,49 @@ test("tryClaimGenerationSlot: returns null (not a live claim) while another proc
   releaseGenerationSlot(db, sessionId, token as string);
   assert.ok(tryClaimGenerationSlot(db, sessionId), "slot should be claimable again after a real release");
 
+  db.close();
+});
+
+// --- pre-`resolved`-column database upgrade ---------------------------------
+//
+// Regression coverage for a dogfooding-discovered bug: SCHEMA_SQL used to
+// embed `CREATE INDEX idx_captured_diffs_pending ... (..., resolved)`
+// directly, right after captured_diffs's `CREATE TABLE IF NOT EXISTS`. On a
+// database that predates the `resolved` column, that CREATE TABLE is a
+// no-op (the table already exists with its old columns), so the index
+// statement — still inside the same unconditional SCHEMA_SQL exec — failed
+// with "no such column: resolved" before migrateSchema() ever got a chance
+// to add the column. See DECISIONS.md.
+
+test("openStore: migrates a pre-`resolved`-column captured_diffs table instead of throwing", () => {
+  const dbPath = tempDbPath();
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    CREATE TABLE IF NOT EXISTS captured_diffs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      prompt_id TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      captured_at TEXT NOT NULL,
+      diff_json TEXT NOT NULL,
+      filtered INTEGER NOT NULL DEFAULT 0,
+      filter_reason TEXT
+    );
+  `);
+  legacy.close();
+
+  const db = openStore(dbPath);
+  const columns = db.prepare(`PRAGMA table_info(captured_diffs)`).all() as Array<{ name: string }>;
+  assert.ok(
+    columns.some((c) => c.name === "resolved"),
+    "resolved column should be added by migrateSchema"
+  );
+  const indexes = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'captured_diffs'`)
+    .all() as Array<{ name: string }>;
+  assert.ok(
+    indexes.some((i) => i.name === "idx_captured_diffs_pending"),
+    "idx_captured_diffs_pending should still be created after migration"
+  );
   db.close();
 });

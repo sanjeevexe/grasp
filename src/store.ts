@@ -112,9 +112,14 @@ const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_captured_diffs_turn ON captured_diffs(session_id, prompt_id);
 
-  -- Backs the batched-at-Stop gather query: every unresolved, passed-filter
-  -- capture for a given (session, repo) — see getUnresolvedCapturedDiffs.
-  CREATE INDEX IF NOT EXISTS idx_captured_diffs_pending ON captured_diffs(session_id, repo, filtered, resolved);
+  -- idx_captured_diffs_pending is NOT created here: on a pre-Prompt-3
+  -- database, captured_diffs exists without the resolved column at this
+  -- point (CREATE TABLE IF NOT EXISTS above is a no-op for it), and this
+  -- file runs unconditionally on every openStore() call — creating an
+  -- index on a column that may not exist yet would fail before
+  -- migrateSchema() gets a chance to add it. See migrateSchema() below,
+  -- which creates this index only after confirming/adding the column,
+  -- safe for both fresh and pre-existing databases.
 
   -- Append-only audit trail of every hook firing Grasp observed. Exists
   -- because hook stdout isn't surfaced to the user, so this is the only
