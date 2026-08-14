@@ -8,7 +8,7 @@ import { classifyIgnoreExclusion, evaluateCapturedDiff, isFileGenerated } from "
 import { loadConfig } from "./config";
 import { createReviewApp } from "./reviewApp";
 import { groupForBatchPresentation } from "./review";
-import { runScanFileGeneration } from "./generation";
+import { runScanFileGeneration, runScanSummary, ScanSummaryChunk } from "./generation";
 import { diffFileContents } from "./adapters/gitDiffCapture";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
 import { FileChunk, splitFileIntoChunks } from "./scanChunking";
@@ -386,6 +386,16 @@ export interface ScanWalkResult {
   capped: boolean;
   /** Files skipped for being over MAX_SCAN_CEILING_LINES this walk — `runScan` prints a visible message for each. */
   oversizedSkips: OversizedSkip[];
+  /**
+   * Every chunk that got a REAL, successful generation call this run (not
+   * mechanically-skipped files, not chunks stuck on a failed attempt) —
+   * genuinely new content this invocation read and processed, for Prompt
+   * 10's run summary. Deliberately excludes chunks already fully covered
+   * BEFORE this run started (those are never re-visited at all — see
+   * `classifyFile`) and files confirmed unchanged via Prompt 9's hash check
+   * (nothing new was read for those either).
+   */
+  processedChunks: ScanSummaryChunk[];
 }
 
 /**
@@ -417,6 +427,7 @@ export function runScanWalk(
   const states = new Map<string, FileWalkState>();
   const oversizedSkips: OversizedSkip[] = [];
   const filesTouched = new Set<string>();
+  const processedChunks: ScanSummaryChunk[] = [];
   let chunksProcessed = 0;
 
   let madeProgress = true;
@@ -424,7 +435,7 @@ export function runScanWalk(
     madeProgress = false;
     for (const filePath of orderedCandidates) {
       if (!full && getSessionQuestionCount(db, sessionId) >= config.scanQuestionsCap) {
-        return { chunksProcessed, filesTouched: filesTouched.size, capped: true, oversizedSkips };
+        return { chunksProcessed, filesTouched: filesTouched.size, capped: true, oversizedSkips, processedChunks };
       }
 
       let state = states.get(filePath);
@@ -443,6 +454,7 @@ export function runScanWalk(
       filesTouched.add(filePath);
       chunksProcessed++;
       if (succeeded) {
+        processedChunks.push({ filePath, startLine: chunk.startLine, lines: chunk.lines });
         state.nextChunkCursor++;
         if (state.nextChunkCursor >= state.chunks!.length) {
           state.done = true;
@@ -466,7 +478,7 @@ export function runScanWalk(
     }
   }
 
-  return { chunksProcessed, filesTouched: filesTouched.size, capped: false, oversizedSkips };
+  return { chunksProcessed, filesTouched: filesTouched.size, capped: false, oversizedSkips, processedChunks };
 }
 
 /**
@@ -535,9 +547,29 @@ export async function runScan(options: { full?: boolean } = {}): Promise<void> {
     process.stdout.write(`$${spentSoFar.toFixed(4)} spent generating comprehension questions this scan.\n`);
   }
 
+  // Prompt 10: a short, plain-language summary of what THIS run actually
+  // read/processed — computed here (so its cost is ready either way) but
+  // printed only once, at the very end (after the interactive review UI, if
+  // one runs — a closing note, not an interruption). Nothing about this
+  // call is persisted; see runScanSummary's own doc comment. Skipped
+  // entirely (no call, no output) when nothing new was actually read this
+  // run — a run that only confirmed already-covered files unchanged (via
+  // Prompt 9's hash check) has nothing new to summarize.
+  const summaryOutcome = walkResult.processedChunks.length > 0 ? runScanSummary(walkResult.processedChunks) : null;
+  const printSummary = () => {
+    if (!summaryOutcome) return;
+    if (summaryOutcome.summary) {
+      process.stdout.write(`\n${summaryOutcome.summary}\n`);
+    }
+    if (summaryOutcome.costUsd !== null && summaryOutcome.costUsd > 0) {
+      process.stdout.write(`$${summaryOutcome.costUsd.toFixed(4)} spent generating this run's summary.\n`);
+    }
+  };
+
   const pending = getPendingQuestions(db, repoRoot, "scan");
   if (pending.length === 0) {
     process.stdout.write("No scan questions right now — you're caught up for what's been looked at so far.\n");
+    printSummary();
     db.close();
     return;
   }
@@ -574,5 +606,6 @@ export async function runScan(options: { full?: boolean } = {}): Promise<void> {
   );
 
   await instance.waitUntilExit();
+  printSummary();
   db.close();
 }

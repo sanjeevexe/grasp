@@ -91,6 +91,8 @@ grasp scan --full
 
 Bypasses `scanQuestionsCap` entirely and walks every remaining unscanned file in one run. This isn't gated behind a confirmation prompt the way `grasp reset history` is — nothing about it is destructive or irreversible — but it does print a plain warning first, since it can mean a genuinely large number of real, billed/rate-limited generation calls: "this will scan the entire codebase and could generate a large number of questions."
 
+If a run actually read and processed anything new (not files it merely confirmed were unchanged), Grasp closes with a short, plain-language summary of what that run covered — a couple of sentences, printed after you've finished the interactive review, never interrupting it. This costs one small extra call, shown on its own line ("$0.0009 spent generating this run's summary") kept visibly separate from the question-generation cost above it — it's never folded into that total, and nothing about it is saved to your history (it doesn't affect `grasp export` or any cap). A run that had nothing new to process (everything already covered, nothing changed) skips this entirely — no call, no extra line.
+
 ## Commands
 
 Day-to-day settings that used to require hand-editing `.grasp.json`/`~/.grasp/config.json` now have dedicated commands. All of them are hand-rolled argument parsing (no CLI framework) — same style as `grasp review --all` — and, like `.grasp.json` itself, default to the current repo unless you pass `--global`.

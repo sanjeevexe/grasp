@@ -131,6 +131,14 @@ Grasp defaults to a gentle reminder, not a hard block. Try both:
 - [ ] Try this on a genuinely large file (a few thousand lines, comfortably past the practical hash-tracking size limit but under the much larger processing ceiling). After it's been fully covered once, edit it by hand and run `grasp scan` again — confirm it's NOT re-detected as changed (this specific size-based limitation is expected, not a bug — see [Known limitations](#known-limitations-so-you-dont-mistake-these-for-bugs)).
 - [ ] Run `grasp reset history` and confirm it clears re-scan tracking too, not just the chunk-coverage/question history (check directly: `sqlite3 ~/.grasp/history.db "select count(*) from scan_file_hashes;"` should read `0` afterward).
 
+### Run summary
+
+- [ ] Run `grasp scan` against a repo with a couple of small, real files it hasn't seen before. Answer or skip through the questions, and confirm a short (a couple of sentences), plain-language summary of what that run covered prints AFTER you've finished the interactive review — not interrupting it partway through.
+- [ ] Confirm the summary's cost appears on its own line ("$0.000X spent generating this run's summary"), visibly separate from the "$ spent generating comprehension questions this scan" line above it.
+- [ ] Run `grasp scan` again immediately in the same repo with nothing new to cover (everything already scanned, no edits). Confirm you get the plain "Nothing left to scan" message with NO summary attempt and no summary cost line at all.
+- [ ] Confirm the summary accurately describes what THAT run actually covered (the files/areas it just read), not a stale description of a previous run or the whole repo in general.
+- [ ] Confirm none of this affects `grasp export` (no new rows, no new columns) or `grasp reset history`'s reported counts — the summary is not saved anywhere.
+
 ## 7. What happens when things go wrong
 
 You don't need to force these, but if any of them happen naturally during testing, take note — and it's worth deliberately trying at least the first two:

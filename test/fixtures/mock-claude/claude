@@ -29,6 +29,34 @@ if (delayMs > 0) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
 }
 
+// Prompt 10's grasp scan run-summary call is recognizable by a unique
+// marker string in buildScanSummaryPrompt's own instruction text (see
+// generation.ts). Detected here, before any GRASP_TEST_MOCK_MODE branch, so
+// every existing mode keeps returning a correct JUDGE-shaped response for
+// judge calls, while a summary call transparently gets a plain-prose
+// response instead — regardless of which mode a test happens to be using
+// for its own judge calls. Controlled independently via GRASP_TEST_SUMMARY_*
+// env vars, defaulting to a plain, always-succeeding response so tests that
+// don't care about the summary specifically aren't forced to configure it.
+const promptArg = process.argv[process.argv.indexOf("-p") + 1] || "";
+if (promptArg.includes("write a short, plain-language summary")) {
+  const summaryLogPath = process.env.GRASP_TEST_SUMMARY_LOG;
+  if (summaryLogPath) {
+    fs.appendFileSync(summaryLogPath, promptArg + "\n---END-PROMPT---\n");
+  }
+  if (process.env.GRASP_TEST_SUMMARY_MODE === "error") {
+    process.stdout.write(JSON.stringify({ total_cost_usd: 0.0005, result: "", is_error: true }));
+    process.exit(0);
+  }
+  const summaryCost = process.env.GRASP_TEST_SUMMARY_COST ? parseFloat(process.env.GRASP_TEST_SUMMARY_COST) : 0.0007;
+  const summaryText =
+    process.env.GRASP_TEST_SUMMARY_TEXT !== undefined
+      ? process.env.GRASP_TEST_SUMMARY_TEXT
+      : "This run covered a couple of files in the codebase.";
+  process.stdout.write(JSON.stringify({ total_cost_usd: summaryCost, result: summaryText, is_error: false }));
+  process.exit(0);
+}
+
 if (mode === "error") {
   process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: "", is_error: true }));
   process.exit(0);
