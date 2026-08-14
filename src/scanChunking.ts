@@ -15,6 +15,25 @@
  */
 export const MAX_SCAN_CHUNK_LINES = 400;
 
+/**
+ * Splits raw file content into real lines, counted the way a human (or
+ * `wc -l`/an editor) would: a trailing newline terminates the last real line
+ * rather than introducing a phantom extra one. `String.split` on a newline
+ * pattern doesn't do this on its own — `"a\nb\n".split(/\n/)` yields
+ * `["a", "b", ""]`, an empty trailing element for the content AFTER the
+ * final newline, which is not a line. Every place that used to compute a
+ * file's lines via a raw `.split(/\r\n|\r|\n/)` should go through this
+ * instead, so `MAX_SCAN_CEILING_LINES`/`MAX_SCAN_CHUNK_LINES`/
+ * `MAX_SCAN_HASH_TRACKING_LINES` boundaries are checked against the file's
+ * real line count. A genuinely empty (0-byte) file has 0 lines, not 1.
+ */
+export function splitFileLines(content: string): string[] {
+  if (content.length === 0) return [];
+  const lines = content.split(/\r\n|\r|\n/);
+  if (/\r\n$|\r$|\n$/.test(content)) lines.pop();
+  return lines;
+}
+
 export interface FileChunk {
   chunkIndex: number;
   /** 1-indexed, inclusive — the chunk's first line in the FILE's own absolute numbering, not relative to the chunk. */

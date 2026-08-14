@@ -11,7 +11,7 @@ import { groupForBatchPresentation } from "./review";
 import { runScanFileGeneration, runScanSummary, ScanSummaryChunk } from "./generation";
 import { diffFileContents } from "./adapters/gitDiffCapture";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
-import { FileChunk, splitFileIntoChunks } from "./scanChunking";
+import { FileChunk, splitFileIntoChunks, splitFileLines } from "./scanChunking";
 import {
   deleteScanProgressForFile,
   getPendingQuestions,
@@ -224,7 +224,7 @@ function classifyFile(
     return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
 
-  const fileLines = buffer.toString("utf-8").split(/\r\n|\r|\n/);
+  const fileLines = splitFileLines(buffer.toString("utf-8"));
   if (fileLines.length > MAX_SCAN_CEILING_LINES) {
     oversizedSkips.push({ filePath, lineCount: fileLines.length });
     markFullyDone();
@@ -301,7 +301,7 @@ export function checkForFileEdits(
     return false;
   }
 
-  const currentLineCount = currentContent.split(/\r\n|\r|\n/).length;
+  const currentLineCount = splitFileLines(currentContent).length;
   if (currentLineCount > MAX_SCAN_HASH_TRACKING_LINES) return false;
 
   const currentHash = computeContentHash(currentContent);

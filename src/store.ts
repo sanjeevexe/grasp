@@ -5,7 +5,7 @@ import { randomUUID } from "crypto";
 import { DB_PATH, GRASP_HOME } from "./paths";
 import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
 import { ConceptTagGlobalRow, ConceptTagRecord, EventRecord, EventSource } from "./types";
-import { countChunksForLineCount } from "./scanChunking";
+import { countChunksForLineCount, splitFileLines } from "./scanChunking";
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS events (
@@ -368,7 +368,7 @@ function migrateScanProgressToChunkGranularity(db: Database.Database): void {
 function countCurrentChunkCountForMigration(repo: string, filePath: string): number {
   try {
     const content = fs.readFileSync(path.join(repo, filePath), "utf-8");
-    const lineCount = content.split(/\r\n|\r|\n/).length;
+    const lineCount = splitFileLines(content).length;
     return countChunksForLineCount(lineCount);
   } catch {
     return 1;

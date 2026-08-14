@@ -5,7 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { execFileSync } from "child_process";
 import { orderFilesRoundRobin, runScanWalk } from "../src/scan";
-import { MAX_SCAN_CHUNK_LINES } from "../src/scanChunking";
+import { MAX_SCAN_CHUNK_LINES, splitFileIntoChunks, splitFileLines } from "../src/scanChunking";
 import {
   clearHistory,
   getAllAnsweredConceptTags,
@@ -315,6 +315,30 @@ process.stdout.write(JSON.stringify({ total_cost_usd: 0.001, result: JSON.string
   db.close();
 });
 
+test("splitFileLines: a trailing newline is not counted as an extra line", () => {
+  assert.equal(splitFileLines("").length, 0, "a genuinely empty file has 0 lines, not 1");
+  assert.equal(splitFileLines("a\nb\nc\n").length, 3, "3 real, newline-terminated lines must report 3, not 4");
+  assert.equal(splitFileLines("a\nb\nc").length, 3, "a file whose last line ISN'T newline-terminated must still report the correct count");
+  assert.equal(splitFileLines("a\nb\n\n").length, 3, "a genuine trailing blank line before EOF must still be counted");
+});
+
+test("splitFileIntoChunks: a file with exactly MAX_SCAN_CHUNK_LINES real lines must not produce a spurious extra near-empty final chunk", () => {
+  // Regression test for the fileLines.length off-by-one: before the fix, a
+  // newline-terminated file split via the raw `.split(/\r\n|\r|\n/)`
+  // pattern reported one MORE line than it really had, so a file whose real
+  // line count landed exactly on a MAX_SCAN_CHUNK_LINES boundary produced a
+  // second, near-empty chunk consisting of nothing but the phantom trailing
+  // blank "line" — a wasted judge call on nothing.
+  const content = linesFile(MAX_SCAN_CHUNK_LINES);
+  const fileLines = splitFileLines(content);
+  assert.equal(fileLines.length, MAX_SCAN_CHUNK_LINES, "a file of exactly MAX_SCAN_CHUNK_LINES real lines must report exactly that many");
+
+  const chunks = splitFileIntoChunks(fileLines);
+  assert.equal(chunks.length, 1, "exactly MAX_SCAN_CHUNK_LINES real lines must still fit in a single chunk, not spill into a spurious second one");
+  assert.equal(chunks[0].isFinal, true);
+  assert.equal(chunks[0].lines.length, MAX_SCAN_CHUNK_LINES);
+});
+
 test("runScanWalk: a large multi-chunk file genuinely interleaves with small single-chunk files across passes, not one contiguous block", () => {
   const repo = mkTempDir("grasp-test-scan-interleave-repo-");
   git(repo, ["init", "-q"]);
@@ -411,7 +435,7 @@ test("runScanWalk: a file over the new defensive processing ceiling is skipped w
 
   assert.equal(result.oversizedSkips.length, 1);
   assert.equal(result.oversizedSkips[0].filePath, "huge.ts");
-  assert.equal(result.oversizedSkips[0].lineCount, 25_001, "linesFile appends a trailing newline, so split() reports one extra empty final line");
+  assert.equal(result.oversizedSkips[0].lineCount, 25_000, "linesFile's trailing newline must not be counted as an extra line");
   assert.ok(getScanCompletedFilePaths(db, repo).has("huge.ts"), "an oversized file must still be marked fully scanned, same permanence as other skip categories");
   const eventCount = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
   assert.equal(eventCount, 0);
