@@ -1,19 +1,22 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as React from "react";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { loadInk } from "./inkLoader";
 import { listTrackedFiles, resolveRepoRoot } from "./git";
-import { classifyIgnoreExclusion, isFileGenerated } from "./filter";
+import { classifyIgnoreExclusion, evaluateCapturedDiff, isFileGenerated } from "./filter";
 import { loadConfig } from "./config";
 import { createReviewApp } from "./reviewApp";
 import { groupForBatchPresentation } from "./review";
 import { runScanFileGeneration } from "./generation";
-import { DiffFile } from "./adapters/agentAdapter";
+import { diffFileContents } from "./adapters/gitDiffCapture";
+import { CapturedDiff, DiffFile } from "./adapters/agentAdapter";
 import { FileChunk, splitFileIntoChunks } from "./scanChunking";
 import {
+  deleteScanProgressForFile,
   getPendingQuestions,
   getScanCompletedFilePaths,
+  getScanFileHash,
   getScannedChunkIndexes,
   getSessionCostUsd,
   getSessionQuestionCount,
@@ -22,6 +25,7 @@ import {
   markEventSkipped,
   markInstanceAnswered,
   openStore,
+  upsertScanFileHash,
 } from "./store";
 
 /**
@@ -51,6 +55,27 @@ import {
  * 20,000.
  */
 const MAX_SCAN_CEILING_LINES = 20_000;
+
+/**
+ * A separate, smaller practical limit on what `scan_file_hashes` bothers
+ * storing/diffing — distinct from `MAX_SCAN_CEILING_LINES` above, which
+ * governs whether a file gets CHUNKED at all. `scan_file_hashes` stores a
+ * full second COPY of a file's content (see that table's own schema
+ * comment for why: a hash alone can tell you something changed but not
+ * what), so tracking every file up to the much larger chunking ceiling
+ * would mean the database could end up holding a near-duplicate of a
+ * large fraction of a big repo's entire source tree. Files over this limit
+ * still get scanned/chunked completely normally — they just don't get
+ * hash-based re-scan tracking, so once fully covered they keep the
+ * original, permanent "never revisited" behavior chunking already had. See
+ * DECISIONS.md's "grasp scan: hash-based re-scan" entry for the reasoning
+ * behind 5,000.
+ */
+const MAX_SCAN_HASH_TRACKING_LINES = 5_000;
+
+function computeContentHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
 
 /** How many bytes from the start of a file are sniffed for a NUL byte to decide "this is binary, not source code" — cheap and reliable enough for a defensive pre-generation guard, not a full content-type detector. */
 const BINARY_SNIFF_BYTES = 8192;
@@ -150,6 +175,8 @@ interface FileWalkState {
   nextChunkCursor: number;
   done: boolean;
   stuckThisRun: boolean;
+  /** The file's full current content, for hash-based re-scan tracking (see `MAX_SCAN_HASH_TRACKING_LINES`) — null for mechanically-skipped files (hash tracking only applies to files that actually go through chunked generation, see DECISIONS.md's "grasp scan: hash-based re-scan" entry). */
+  wholeFileContent: string | null;
 }
 
 /**
@@ -175,11 +202,11 @@ function classifyFile(
   const ignoreReason = classifyIgnoreExclusion(filePath, config);
   if (ignoreReason) {
     markFullyDone();
-    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
   if (isFileGenerated(toWholeFileDiffFile(filePath), repoRoot)) {
     markFullyDone();
-    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
 
   let buffer: Buffer;
@@ -189,19 +216,19 @@ function classifyFile(
     // Unreadable (permissions, a symlink to nowhere, deleted between the
     // walk listing and now) — nothing productive to retry here.
     markFullyDone();
-    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
 
   if (looksBinary(buffer)) {
     markFullyDone();
-    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
 
   const fileLines = buffer.toString("utf-8").split(/\r\n|\r|\n/);
   if (fileLines.length > MAX_SCAN_CEILING_LINES) {
     oversizedSkips.push({ filePath, lineCount: fileLines.length });
     markFullyDone();
-    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false };
+    return { chunks: null, totalFileLines: 0, nextChunkCursor: 0, done: true, stuckThisRun: false, wholeFileContent: null };
   }
 
   const chunks = splitFileIntoChunks(fileLines);
@@ -209,7 +236,108 @@ function classifyFile(
   let cursor = 0;
   while (cursor < chunks.length && alreadyScanned.has(cursor)) cursor++;
 
-  return { chunks, totalFileLines: fileLines.length, nextChunkCursor: cursor, done: cursor >= chunks.length, stuckThisRun: false };
+  return {
+    chunks,
+    totalFileLines: fileLines.length,
+    nextChunkCursor: cursor,
+    done: cursor >= chunks.length,
+    stuckThisRun: false,
+    wholeFileContent: buffer.toString("utf-8"),
+  };
+}
+
+/**
+ * Records the content/hash a file was just fully processed at — called the
+ * moment a file's walk completes under the chunked walk (see the caller in
+ * `runScanWalk`). A no-op for files over `MAX_SCAN_HASH_TRACKING_LINES` —
+ * see that constant's own comment for why.
+ */
+function recordFileHashIfTrackable(
+  db: ReturnType<typeof openStore>,
+  repoRoot: string,
+  filePath: string,
+  content: string,
+  totalFileLines: number
+): void {
+  if (totalFileLines > MAX_SCAN_HASH_TRACKING_LINES) return;
+  upsertScanFileHash(db, repoRoot, filePath, computeContentHash(content), content);
+}
+
+/**
+ * `grasp scan`'s hash-based re-scan check (Prompt 9) — called once per
+ * already-fully-covered file, before it's filtered out of this run's
+ * candidate list, to decide whether it needs to re-enter the walk. Whole-
+ * file hashing, not per-chunk, DELIBERATELY: chunk boundaries are
+ * position-based, so an edit near the top of a file shifts every later
+ * chunk's boundaries, making unrelated later chunks falsely look "changed"
+ * if compared chunk-by-chunk — see DECISIONS.md's "grasp scan: hash-based
+ * re-scan" entry.
+ *
+ * Returns `true` when the file must re-enter the walk (a real, non-trivial
+ * change was found and its stale chunk coverage was just cleared) —
+ * `false` in every other case (no hash on record yet, unreadable, over the
+ * hash-tracking size limit, unchanged, or a real-but-trivial change that
+ * was absorbed by just updating the stored hash/content).
+ *
+ * Exported for direct testing, same rationale as `orderFilesRoundRobin`/
+ * `runScanWalk` above — `runScan` itself needs a real TTY and isn't a
+ * practical unit-test surface.
+ */
+export function checkForFileEdits(
+  db: ReturnType<typeof openStore>,
+  repoRoot: string,
+  config: ReturnType<typeof loadConfig>["config"],
+  filePath: string
+): boolean {
+  const stored = getScanFileHash(db, repoRoot, filePath);
+  if (!stored) return false;
+
+  let currentContent: string;
+  try {
+    currentContent = fs.readFileSync(path.join(repoRoot, filePath), "utf-8");
+  } catch {
+    // Deleted/unreadable since it was last scanned — nothing productive to
+    // diff against; leave its existing coverage exactly as it is.
+    return false;
+  }
+
+  const currentLineCount = currentContent.split(/\r\n|\r|\n/).length;
+  if (currentLineCount > MAX_SCAN_HASH_TRACKING_LINES) return false;
+
+  const currentHash = computeContentHash(currentContent);
+  if (currentHash === stored.contentHash) return false;
+
+  // Hash differs — compute a real diff and run it through the SAME
+  // mechanical filter the live diff-capture path uses, per the task's own
+  // explicit instruction, rather than inventing scan-specific thresholds.
+  const { insertions, deletions, hunks } = diffFileContents(repoRoot, stored.content, currentContent);
+  const syntheticDiff: CapturedDiff = {
+    repo: repoRoot,
+    capturedAt: new Date().toISOString(),
+    files: [{ path: filePath, oldPath: null, status: "modified", insertions, deletions, hunks }],
+    rawDiffText: "",
+    diffHash: null,
+  };
+  const verdict = evaluateCapturedDiff(syntheticDiff, config);
+
+  if (!verdict.passed) {
+    // A real difference, but the filter judges it trivial (formatting-only,
+    // now-ignored, now-generated, etc.) — absorb it without reprocessing.
+    upsertScanFileHash(db, repoRoot, filePath, currentHash, currentContent);
+    return false;
+  }
+
+  // A real, non-trivial change — clear stale chunk coverage and update the
+  // stored hash/content IMMEDIATELY (not after the re-walk completes: see
+  // DECISIONS.md's "grasp scan: hash-based re-scan" entry for why this
+  // keeps the model simple and always accurate about current state, even
+  // though it doesn't perfectly protect an in-progress catch-up from an
+  // overlapping second edit). The file re-enters the walk from chunk 0 the
+  // moment this returns, simply by no longer appearing in
+  // getScanCompletedFilePaths.
+  deleteScanProgressForFile(db, repoRoot, filePath);
+  upsertScanFileHash(db, repoRoot, filePath, currentHash, currentContent);
+  return true;
 }
 
 /**
@@ -316,7 +444,17 @@ export function runScanWalk(
       chunksProcessed++;
       if (succeeded) {
         state.nextChunkCursor++;
-        if (state.nextChunkCursor >= state.chunks!.length) state.done = true;
+        if (state.nextChunkCursor >= state.chunks!.length) {
+          state.done = true;
+          // The file just became fully covered this run — record its
+          // current whole-file content/hash for Prompt 9's re-scan check,
+          // using the SAME content this run's own chunks were read from
+          // (not a fresh re-read), so the stored snapshot is exactly what
+          // was actually processed.
+          if (state.wholeFileContent !== null) {
+            recordFileHashIfTrackable(db, repoRoot, filePath, state.wholeFileContent, state.totalFileLines);
+          }
+        }
         madeProgress = true;
       } else {
         // Leave nextChunkCursor untouched (scan_progress wasn't updated
@@ -350,7 +488,16 @@ export async function runScan(options: { full?: boolean } = {}): Promise<void> {
 
   const allTracked = listTrackedFiles(repoRoot);
   const completedSet = getScanCompletedFilePaths(db, repoRoot);
-  const candidates = allTracked.filter((f) => !completedSet.has(f));
+  // Prompt 9: a fully-covered file isn't necessarily still up to date —
+  // before treating it as permanently skippable, check whether its content
+  // has genuinely changed since it was last scanned. A file NOT in
+  // completedSet is already a normal candidate regardless (never scanned,
+  // or only partially chunked), so this only runs against already-complete
+  // files, and only reopens the ones where a real edit is found.
+  const candidates = allTracked.filter((f) => {
+    if (!completedSet.has(f)) return true;
+    return checkForFileEdits(db, repoRoot, config, f);
+  });
 
   if (candidates.length === 0) {
     const pendingScan = getPendingQuestions(db, repoRoot, "scan");

@@ -125,6 +125,10 @@ function countInsertions(hunks: DiffHunk[]): number {
   return hunks.reduce((sum, h) => sum + h.lines.filter((l) => l.startsWith("+")).length, 0);
 }
 
+function countDeletions(hunks: DiffHunk[]): number {
+  return hunks.reduce((sum, h) => sum + h.lines.filter((l) => l.startsWith("-")).length, 0);
+}
+
 /**
  * The same file-level diff parsing logic (name-status for status/rename,
  * numstat for insertion/deletion counts, raw diff text hand-split into
@@ -163,6 +167,49 @@ function diffFilesBetween(
   });
 
   return { files, rawDiffText };
+}
+
+/**
+ * Diffs two arbitrary content strings against each other via `git diff
+ * --no-index` on two throwaway temp files, reusing the exact same hunk
+ * extraction (`extractHunks`) and insertion/deletion counting this module
+ * already uses for every other diff it computes — not a second, parallel
+ * differ. `--no-index` works on any two files regardless of whether `cwd`
+ * is even inside a git repo (it bypasses the repo/index entirely), so
+ * `repoPath` here is only used as the subprocess's working directory, not
+ * as a meaningful git context. Built for `grasp scan`'s hash-based re-scan
+ * (see DECISIONS.md's "grasp scan: hash-based re-scan" entry): comparing a
+ * previously-scanned file's stored content against its current on-disk
+ * content to decide whether an edit is real or trivial, using the SAME
+ * mechanical filter (`evaluateCapturedDiff`) the live diff-capture path
+ * already applies to every agent-made change.
+ */
+export function diffFileContents(
+  repoPath: string,
+  oldContent: string,
+  newContent: string
+): { insertions: number; deletions: number; hunks: DiffHunk[] } {
+  const absoluteRepoPath = path.resolve(repoPath);
+  const stamp = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const oldTmpPath = path.join(os.tmpdir(), `grasp-scan-hash-old-${stamp}`);
+  const newTmpPath = path.join(os.tmpdir(), `grasp-scan-hash-new-${stamp}`);
+  try {
+    fs.writeFileSync(oldTmpPath, oldContent);
+    fs.writeFileSync(newTmpPath, newContent);
+    // git diff --no-index exits 1 when it finds differences (expected, not
+    // an error) — same convention already relied on for untracked files
+    // above.
+    const diffText = runGit(
+      absoluteRepoPath,
+      ["diff", "--no-color", "--no-index", "--", oldTmpPath, newTmpPath],
+      [0, 1]
+    ).stdout;
+    const hunks = extractHunks(diffText.replace(/\n$/, ""));
+    return { insertions: countInsertions(hunks), deletions: countDeletions(hunks), hunks };
+  } finally {
+    fs.rmSync(oldTmpPath, { force: true });
+    fs.rmSync(newTmpPath, { force: true });
+  }
 }
 
 /**

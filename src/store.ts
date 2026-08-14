@@ -195,6 +195,29 @@ const SCHEMA_SQL = `
   -- a no-op for it), so creating an index on those columns here would fail
   -- before migrateSchema() gets a chance to add them. Created only inside
   -- migrateSchema(), after the migration below runs.
+
+  -- \`grasp scan\`'s hash-based re-scan (see DECISIONS.md's "grasp scan:
+  -- hash-based re-scan" entry) — a brand-new table, so (unlike
+  -- scan_progress) there's no pre-existing shape to migrate. One row per
+  -- (repo, file_path) a file's LAST FULLY-PROCESSED whole-file content was
+  -- hashed at, storing enough of the actual content (\`content\`) to diff
+  -- against later, not just the hash — a hash alone can tell you SOMETHING
+  -- changed but not what, and a real diff is needed to run the change
+  -- through the same mechanical filter the live diff-capture path uses.
+  -- Deliberately separate from scan_progress (chunk-level, positional) —
+  -- see that table's own migration-era comment for why chunk boundaries are
+  -- position-based and therefore a bad unit for edit detection (an edit
+  -- near the top of a file shifts every later chunk's boundaries, making
+  -- unrelated later chunks falsely look "changed"); whole-file hashing
+  -- avoids that entirely.
+  CREATE TABLE IF NOT EXISTS scan_file_hashes (
+    repo TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    last_scanned_at TEXT NOT NULL,
+    PRIMARY KEY (repo, file_path)
+  );
 `;
 
 /**
@@ -1153,36 +1176,46 @@ export function recordHookInvocation(
  * caller can show "about to delete N/M rows" before asking for
  * confirmation, not just after.
  */
-export function getHistoryRowCounts(db: Database.Database): { events: number; conceptTags: number; scanProgress: number } {
+export function getHistoryRowCounts(
+  db: Database.Database
+): { events: number; conceptTags: number; scanProgress: number; scanFileHashes: number } {
   const events = (db.prepare(`SELECT COUNT(*) AS n FROM events`).get() as { n: number }).n;
   const conceptTags = (db.prepare(`SELECT COUNT(*) AS n FROM concept_tags`).get() as { n: number }).n;
   const scanProgress = (db.prepare(`SELECT COUNT(*) AS n FROM scan_progress`).get() as { n: number }).n;
-  return { events, conceptTags, scanProgress };
+  const scanFileHashes = (db.prepare(`SELECT COUNT(*) AS n FROM scan_file_hashes`).get() as { n: number }).n;
+  return { events, conceptTags, scanProgress, scanFileHashes };
 }
 
 /**
  * Wipes stored question/answer history: `events`, `concept_tags` (a
  * separate table, `event_id`-linked — clearing only one would leave the
  * other stale/orphaned, see this file's schema comment), AND
- * `scan_progress`. Irreversible; callers are responsible for confirming
- * with the user first (see `grasp reset history` in reset.ts). Deliberately
- * does NOT touch `cc_turns`/`captured_diffs`/`capture_checkpoints`/
- * `hook_invocations`/`generation_reservations` — those are session/turn
- * bookkeeping, not "history" in the question/answer sense this command
- * promises to reset, and clearing them isn't needed for `events`/
- * `concept_tags` to be consistent with each other. `scan_progress` IS
- * cleared here, as a deliberate exception to that rule: `grasp scan`'s own
- * "nothing left to scan" message points at `grasp reset history` as the way
- * to scan from scratch (see DECISIONS.md's `grasp scan` entries), so this is
- * the one bookkeeping table reset history is explicitly documented to also
- * reset — leaving it untouched would make that pointer a dead end.
+ * `scan_progress`/`scan_file_hashes`. Irreversible; callers are responsible
+ * for confirming with the user first (see `grasp reset history` in
+ * reset.ts). Deliberately does NOT touch `cc_turns`/`captured_diffs`/
+ * `capture_checkpoints`/`hook_invocations`/`generation_reservations` — those
+ * are session/turn bookkeeping, not "history" in the question/answer sense
+ * this command promises to reset, and clearing them isn't needed for
+ * `events`/`concept_tags` to be consistent with each other.
+ * `scan_progress`/`scan_file_hashes` ARE cleared here, as a deliberate
+ * exception to that rule: `grasp scan`'s own "nothing left to scan" message
+ * points at `grasp reset history` as the way to scan from scratch (see
+ * DECISIONS.md's `grasp scan` entries), so these are the bookkeeping tables
+ * reset history is explicitly documented to also reset — leaving either
+ * untouched would make that pointer a dead end (a cleared `scan_progress`
+ * with a leftover `scan_file_hashes` row would still show a "fresh" file's
+ * first scan as a hash MISMATCH against stale content, running it through
+ * the edit-detection path for a file that was never really scanned before).
  */
-export function clearHistory(db: Database.Database): { events: number; conceptTags: number; scanProgress: number } {
+export function clearHistory(
+  db: Database.Database
+): { events: number; conceptTags: number; scanProgress: number; scanFileHashes: number } {
   const counts = getHistoryRowCounts(db);
   const run = db.transaction(() => {
     db.prepare(`DELETE FROM concept_tags`).run();
     db.prepare(`DELETE FROM events`).run();
     db.prepare(`DELETE FROM scan_progress`).run();
+    db.prepare(`DELETE FROM scan_file_hashes`).run();
   });
   run();
   return counts;
@@ -1236,6 +1269,62 @@ export function markChunkScanned(
     `INSERT INTO scan_progress (repo, file_path, chunk_index, is_final_chunk, scanned_at) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(repo, file_path, chunk_index) DO UPDATE SET is_final_chunk = excluded.is_final_chunk, scanned_at = excluded.scanned_at`
   ).run(repo, filePath, chunkIndex, isFinal ? 1 : 0, new Date().toISOString());
+}
+
+/**
+ * Deletes every `scan_progress` row for (repo, filePath) — used by the
+ * hash-based re-scan check when a real (non-trivial) edit is detected: the
+ * file's chunk coverage is now stale, so it re-enters the normal chunked
+ * walk from chunk 0 the moment this returns (it simply stops appearing in
+ * `getScanCompletedFilePaths`).
+ */
+export function deleteScanProgressForFile(db: Database.Database, repo: string, filePath: string): void {
+  db.prepare(`DELETE FROM scan_progress WHERE repo = ? AND file_path = ?`).run(repo, filePath);
+}
+
+// --- grasp scan: hash-based re-scan for edited files ------------------------
+
+export interface ScanFileHashRecord {
+  contentHash: string;
+  content: string;
+}
+
+/**
+ * The stored content/hash a file was last FULLY PROCESSED at, or `null` if
+ * none is on record — either a file that's never been hash-tracked yet
+ * (never fully scanned under this feature, e.g. a file whose `scan_progress`
+ * rows predate hash tracking, or one over the practical hash-tracking size
+ * limit — see `scan.ts`'s `MAX_SCAN_HASH_TRACKING_LINES`) or one that
+ * simply hasn't been scanned at all yet. Either way, `null` means "nothing
+ * to compare against" — the caller leaves the file alone rather than
+ * attempting a diff against content that was never recorded.
+ */
+export function getScanFileHash(db: Database.Database, repo: string, filePath: string): ScanFileHashRecord | null {
+  const row = db
+    .prepare(`SELECT content_hash, content FROM scan_file_hashes WHERE repo = ? AND file_path = ?`)
+    .get(repo, filePath) as { content_hash: string; content: string } | undefined;
+  return row ? { contentHash: row.content_hash, content: row.content } : null;
+}
+
+/**
+ * Records (or updates) the content/hash a file was last fully processed or
+ * confirmed-unchanged at. Called in two situations (see `scan.ts`'s
+ * `checkForFileEdits`/walk completion): once, the moment a file's walk
+ * completes under the chunked walk; and again, whenever a later hash check
+ * finds a real difference that the mechanical filter judges trivial —
+ * updating without triggering reprocessing.
+ */
+export function upsertScanFileHash(
+  db: Database.Database,
+  repo: string,
+  filePath: string,
+  contentHash: string,
+  content: string
+): void {
+  db.prepare(
+    `INSERT INTO scan_file_hashes (repo, file_path, content_hash, content, last_scanned_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(repo, file_path) DO UPDATE SET content_hash = excluded.content_hash, content = excluded.content, last_scanned_at = excluded.last_scanned_at`
+  ).run(repo, filePath, contentHash, content, new Date().toISOString());
 }
 
 export function countHookInvocations(
