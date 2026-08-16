@@ -12,9 +12,11 @@ import { parseCsv } from "../lib/csv";
 /**
  * `grasp set`/`grasp reset`/`grasp export` — every subcommand, local and
  * `--global`, config-file preservation of unrelated keys, `reset history`'s
- * interactive y/N confirmation driven for real via piped (non-TTY, but
- * still readline-driven — see cli.ts's own doc comment) stdin, and all
- * three export shapes producing valid, correctly-quoted CSVs.
+ * interactive y/N confirmation driven both via piped (non-TTY, but still
+ * readline-driven — see cli.ts's own doc comment) stdin AND a real pty
+ * keystroke for both the decline and the actual delete-triggering accept
+ * branch (not just the `--yes` bypass), and all three export shapes
+ * producing valid, correctly-quoted CSVs.
  */
 
 export const setResetExportScenarios = [
@@ -98,7 +100,7 @@ export const setResetExportScenarios = [
     assert.equal(afterReset.scanQuestionsCap, 15);
   }),
 
-  scenario("reset: `reset history` asks for real y/N confirmation via piped stdin — N deletes nothing, --yes bypasses and deletes", async () => {
+  scenario("reset: `reset history` asks for real y/N confirmation — N (piped and real pty) deletes nothing, a real pty 'y' keystroke deletes, --yes bypasses and deletes too", async () => {
     const repo = initScratchRepo();
     commitFile(repo, "README.md", "# scratch\n");
     const home = isolatedHome();
@@ -168,6 +170,46 @@ export const setResetExportScenarios = [
     afterYes.close();
     assert.equal(afterYesCounts.events, 0);
     assert.equal(afterYesCounts.conceptTags, 0);
+
+    // The actual ACCEPT branch, driven through a real interactive "y"
+    // keystroke over a genuine pty — not `--yes`, and not piped stdin. The
+    // decline case above already proved readline-over-pty behaves the same
+    // as readline-over-piped-stdin; this closes the loop by proving the same
+    // for the branch that actually deletes rows, so nothing about this
+    // scenario's real destructive path is verified only through the `--yes`
+    // bypass.
+    const dbForPtyAccept = openHomeDb(home);
+    insertEvent(dbForPtyAccept, {
+      timestamp: new Date().toISOString(),
+      repo,
+      sessionId: "e2e-reset-history-pty-accept-session",
+      diffHash: "def",
+      diffSummary: "1 file changed",
+      questionConcept: "concept q 2",
+      questionInstance: "instance q 2",
+      questionType: "both",
+      generationSource: "e2e-seed",
+      missReason: null,
+      answerConcept: null,
+      answerInstance: null,
+      skipped: false,
+      skipReason: null,
+      costUsd: 0.001,
+      diffFiles: [],
+    }, [{ tag: "e2e-reset-tag-2", answered: false }]);
+    const beforePtyAcceptCounts = getHistoryRowCounts(dbForPtyAccept);
+    dbForPtyAccept.close();
+    assert.ok(beforePtyAcceptCounts.events >= 1, "sanity check: there is real, non-trivial data seeded for the pty accept to delete");
+
+    const ptyAccept = await runGraspPty(CLI_PATH, ["reset", "history"], [waitFor("Continue? [y/N]"), sendText("y", Key.ENTER)], { cwd: repo, env, cols: 120, rows: 20 });
+    assert.equal(ptyAccept.code, 0, `pty driver failed: ${ptyAccept.stderr}`);
+    assert.match(ptyAccept.screen, /Deleted \d+ event row/, "a real 'y' keystroke over a genuine pty must actually delete, same as --yes");
+
+    const afterPtyAccept = openHomeDb(home);
+    const afterPtyAcceptCounts = getHistoryRowCounts(afterPtyAccept);
+    afterPtyAccept.close();
+    assert.equal(afterPtyAcceptCounts.events, 0, "a real pty-driven 'y' must actually delete the seeded rows, not just print success");
+    assert.equal(afterPtyAcceptCounts.conceptTags, 0);
   }),
 
   scenario("export: default/--anki/--raw all produce valid, correctly-quoted CSVs with a real source column/tag", async () => {
