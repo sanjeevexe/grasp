@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { scenario } from "../lib/scenario";
 import { isolatedHome, mkTempDir, graspEnv, CLI_PATH } from "../lib/env";
-import { runGraspPty, Key, waitFor, sendText, sleepStep, resizeStep, PtyStep } from "../lib/ptyDriver";
+import { runGraspPty, Key, waitFor, waitForFresh, sendText, sleepStep, resizeStep, PtyStep } from "../lib/ptyDriver";
 import { openHomeDb } from "../lib/db";
 import { insertEvent, getEventById, getConceptTagsByEventId } from "../../../src/store";
 import type { DiffFile } from "../../../src/adapters/agentAdapter";
@@ -303,11 +303,19 @@ export const reviewScenarios = [
       waitFor("A mutex is a mutual-exclusion lock."), // sample answer still shown even though declined
       sendText(Key.ENTER),
       waitFor("Instance question:"),
-      sendText(Key.ESCAPE),
-      sleepStep(0.3),
-      sendText(Key.ENTER),
-      sleepStep(0.3),
-      sendText(Key.ESCAPE),
+      sendText(Key.ESCAPE), // first Escape on the instance phase -> explanation (same shared explanation text as the concept phase's own, above)
+      // The instance phase's explain/retry-hint text is IDENTICAL to the
+      // concept phase's own (same shared `conceptExplanation`/"[Esc] skip"
+      // strings, already matched once above) — a plain waitFor would
+      // false-positive on that stale, already-buffered occurrence and
+      // return immediately without actually waiting for the new render,
+      // silently turning the wait into a no-op racing the next `send`. See
+      // DECISIONS.md's "PTY e2e harness: stale-text false positives in
+      // wait_for" entry for why waitForFresh exists and is required here.
+      waitForFresh("A mutex protects a shared resource so only one thread accesses it at once."),
+      sendText(Key.ENTER), // continue -> back to the instance question, one retry
+      waitForFresh("[Esc] skip"), // retry-attempt hint wording must have changed, for THIS (instance) phase
+      sendText(Key.ESCAPE), // second Escape -> the real, terminal decline
       waitFor("Because only one goroutine may touch cache at a time."),
       sendText(Key.ENTER),
     ]);

@@ -27,6 +27,14 @@ spec.json: {
   "final_wait_seconds": 1.0,    # optional: how long to keep reading after the last step
   "steps": [
     {"type": "wait_for", "text": "...", "timeout": 5},
+    # "since_now": true (optional, default false) restricts the match to
+    # bytes read AFTER this step starts, ignoring any earlier occurrence
+    # already sitting in the buffer — for waiting on text that's genuinely
+    # phase-agnostic and may have already appeared once earlier in the same
+    # run (e.g. a hint string reused across two different question phases),
+    # where the default whole-buffer match would false-positive on the
+    # stale occurrence instead of actually waiting for the new render.
+    {"type": "wait_for", "text": "...", "timeout": 5, "since_now": True},
     {"type": "send", "text": "..."},
     {"type": "sleep", "seconds": 0.3},
     {"type": "resize", "cols": 80, "rows": 24},
@@ -91,11 +99,16 @@ def main():
                 break
         return got_any
 
-    def wait_for(text, timeout):
+    def wait_for(text, timeout, since_now=False):
+        # `buf` only ever grows (see read_available above) — capturing its
+        # current length up front and slicing from there is a stable "search
+        # only what arrives from this point on" window, immune to whatever
+        # got appended earlier in the run.
+        start = len(buf) if since_now else 0
         end = time.time() + timeout
         while time.time() < end:
             read_available(0.2)
-            if text.encode() in buf:
+            if text.encode() in buf[start:]:
                 return True
         return False
 
@@ -128,7 +141,7 @@ def main():
             t = step.get("type")
             try:
                 if t == "wait_for":
-                    if not wait_for(step["text"], step.get("timeout", 5)):
+                    if not wait_for(step["text"], step.get("timeout", 5), step.get("since_now", False)):
                         print(f"TIMEOUT waiting for: {step['text']!r}", file=sys.stderr)
                         ok = False
                         break

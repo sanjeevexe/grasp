@@ -27,7 +27,7 @@ import { mkTempDir } from "./env";
  */
 
 export type PtyStep =
-  | { type: "wait_for"; text: string; timeout?: number }
+  | { type: "wait_for"; text: string; timeout?: number; since_now?: boolean }
   | { type: "send"; text: string }
   | { type: "sleep"; seconds: number }
   | { type: "resize"; cols: number; rows: number }
@@ -149,6 +149,21 @@ export function sendText(...parts: string[]): PtyStep {
 
 export function waitFor(text: string, timeout = 8): PtyStep {
   return { type: "wait_for", text, timeout };
+}
+
+/**
+ * Like `waitFor`, but ignores any occurrence of `text` already sitting in
+ * the buffer before this step starts — only a match in bytes read AFTER
+ * this step begins counts. Needed whenever the target text is genuinely
+ * phase-agnostic and may have already appeared once earlier in the same
+ * scenario (e.g. a hint string identical across two different question
+ * phases) — a plain `waitFor` there would false-positive on the stale
+ * occurrence and return immediately without actually waiting for the new
+ * render, silently turning the wait into a no-op. See DECISIONS.md's "PTY
+ * e2e harness: stale-text false positives in wait_for" entry.
+ */
+export function waitForFresh(text: string, timeout = 8): PtyStep {
+  return { type: "wait_for", text, timeout, since_now: true };
 }
 
 export function sleepStep(seconds: number): PtyStep {

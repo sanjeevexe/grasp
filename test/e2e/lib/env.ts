@@ -120,6 +120,21 @@ export function graspEnv(home: string, mock: MockClaudeOptions = {}, extra: Reco
   const base: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: home,
+    // Forces chalk (used directly by ink and by ink-text-input's placeholder
+    // rendering) to its plain, no-ANSI level regardless of what the HOST
+    // terminal's own color-support detection would otherwise decide — see
+    // DECISIONS.md's "PTY e2e harness: forcing color off for every scenario"
+    // entry. This repo's chalk version (5.x) reads FORCE_COLOR, not
+    // NO_COLOR (verified: its vendored supports-color detection has no
+    // NO_COLOR handling at all) — set both anyway so a future chalk
+    // upgrade or any other dependency that DOES honor NO_COLOR stays
+    // covered too, but FORCE_COLOR=0 is the one actually load-bearing here.
+    // Placed after the `...process.env` spread so it always wins over
+    // whatever the outer shell happens to have set (including an inherited
+    // FORCE_COLOR=1, which is exactly the condition that made this bug
+    // reproduce here at all).
+    FORCE_COLOR: "0",
+    NO_COLOR: "1",
   };
 
   if (claudeMode() === "mock") {
