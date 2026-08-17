@@ -18,6 +18,8 @@
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
     "pretest": "npm run build",
     "test": "tsc -p tsconfig.test.json && node --test test-dist/test/*.test.js",
+    "pretest:e2e": "npm run build && tsc -p tsconfig.test.json",
+    "test:e2e": "node test-dist/test/e2e/runner.js",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

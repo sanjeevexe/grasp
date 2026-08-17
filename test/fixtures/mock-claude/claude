@@ -165,11 +165,21 @@ if (counterPath) {
   fs.writeFileSync(counterPath, String(n));
 }
 const cost = process.env.GRASP_TEST_MOCK_COST ? parseFloat(process.env.GRASP_TEST_MOCK_COST) : 0.001;
+// Optional fixed conceptTag override, used by test/e2e's bidirectional
+// concept-tag memoization scenarios (crossCutting.e2e.ts): those need two
+// SPECIFIC, caller-chosen tags reused deterministically across otherwise-
+// independent `grasp review`/`grasp scan` invocations (each its own mock
+// subprocess) to prove memoization is real and global — the counter-based
+// `test-concept-${n}` default can't express "always this exact tag,"
+// including across separate mock-claude process invocations that don't
+// share a counter file. Falls back to the existing counter-based tag when
+// unset, so every pre-existing test/caller is unaffected.
+const conceptTag = process.env.GRASP_TEST_MOCK_CONCEPT_TAG || `test-concept-${n}`;
 const result = {
   worthAsking: true,
-  conceptTag: `test-concept-${n}`,
-  questionConcept: `concept question ${n}`,
-  questionInstance: `instance question ${n}`,
+  conceptTag,
+  questionConcept: `concept question ${n} (${conceptTag})`,
+  questionInstance: `instance question ${n} (${conceptTag})`,
   sampleAnswerConcept: `sample answer for concept ${n}`,
   sampleAnswerInstance: `sample answer for instance ${n}`,
   conceptExplanation: `explanation for concept ${n}`,

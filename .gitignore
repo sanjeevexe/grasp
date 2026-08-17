@@ -4,3 +4,4 @@ test-dist/
 *.log
 .codex-independent-test/
 .grasp-prompt-status
+test/e2e/logs/*.md
