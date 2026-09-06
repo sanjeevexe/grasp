@@ -101,8 +101,13 @@ describe("a real chokidar watcher (§7.1, §22.3 case 1)", () => {
       path.join(repo, "src", "a.ts"),
       "export function guard(items: string[]) {\n  if (items.length === 0) throw new Error('empty');\n  return items;\n}\n",
     );
-    // awaitWriteFinish (300ms) + debounce (80ms) + generation.
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // awaitWriteFinish + debounce + generation can vary substantially under
+    // coverage on slower CI runners. Wait for the observable outcome instead
+    // of assuming a fixed machine speed.
+    const deadline = Date.now() + 5_000;
+    while (notified === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     await watcher.stop();
 
     expect(notified).toBe(1);
