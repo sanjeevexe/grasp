@@ -1,485 +1,799 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
+/**
+ * Generation parsing, validation, clamping, and retry.  GOVERNED BY: §9.4, §9.6, §22.2
+ *
+ * These cover the machinery around the prompt, not the prompt's wording: they
+ * must keep passing while the prompt is rewritten.
+ */
+import { describe, expect, it } from "vitest";
 import {
-  acquireGenerationSlot,
-  buildDiffSummary,
-  isTimeoutError,
-  parseJudgeResponse,
-  runGeneration,
-  GenerationParams,
-} from "../src/generation";
-import { openStore, getConceptTagGlobal, releaseGenerationSlot, tryClaimGenerationSlot } from "../src/store";
-import { diffFile, testConfig } from "./helpers";
+  API_RETRY_DELAYS_MS,
+  MAX_TOKENS,
+  extractDeclaredIdentifiers,
+  findLeakedIdentifiers,
+  generateQuestions,
+  generateSynthesisQuestion,
+  isDistinctiveIdentifier,
+  parseModelJson,
+  stripFences,
+  validateGenerationResult,
+  validateSynthesisResult,
+} from "../src/generation/generateQuestion.js";
+import { ProviderError, type AskOptions, type ModelProvider } from "../src/generation/provider.js";
+import {
+  MAX_KNOWN_TAGS,
+  buildSystemPrompt,
+  buildUserMessage,
+  tierForMastery,
+} from "../src/generation/prompts/systemPrompt.js";
+import { pathsEqual } from "../src/util/paths.js";
+import type { GenerationInput, Tier } from "../src/types/index.js";
 
-// --- parseJudgeResponse: the judge+generate response contract -------------
+const FILES = ["src/hooks/useDebouncedSearch.ts", "src/api/search.ts"];
 
-test("parseJudgeResponse: a well-formed worthAsking=true, both-questions response parses", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "mutex-vs-channel",
-    questionConcept: "What is a mutex?",
-    questionInstance: "Why did this diff use one?",
-    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
-    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
-    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
-  });
-  const parsed = parseJudgeResponse(raw);
-  assert.deepEqual(parsed, {
-    worthAsking: true,
-    conceptTag: "mutex-vs-channel",
-    questionConcept: "What is a mutex?",
-    questionInstance: "Why did this diff use one?",
-    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
-    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
-    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
-  });
-});
-
-test("parseJudgeResponse: worthAsking=true with a null questionConcept (already-known concept) parses", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "mutex-vs-channel",
-    questionConcept: null,
-    questionInstance: "Why did this diff use one?",
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
-    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
-  });
-  const parsed = parseJudgeResponse(raw);
-  assert.equal(parsed?.questionConcept, null);
-  assert.equal(parsed?.questionInstance, "Why did this diff use one?");
-  assert.equal(parsed?.sampleAnswerConcept, null);
-});
-
-test("parseJudgeResponse: a well-formed worthAsking=false response parses", () => {
-  const raw = JSON.stringify({
-    worthAsking: false,
-    conceptTag: null,
-    questionConcept: null,
-    questionInstance: null,
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: null,
-    conceptExplanation: null,
-  });
-  assert.deepEqual(parseJudgeResponse(raw), {
-    worthAsking: false,
-    conceptTag: null,
-    questionConcept: null,
-    questionInstance: null,
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: null,
-    conceptExplanation: null,
-  });
-});
-
-test("parseJudgeResponse: strips a markdown code fence the model wasn't supposed to add", () => {
-  const raw =
-    "```json\n" +
-    JSON.stringify({
-      worthAsking: false,
-      conceptTag: null,
-      questionConcept: null,
-      questionInstance: null,
-      sampleAnswerConcept: null,
-      sampleAnswerInstance: null,
-      conceptExplanation: null,
-    }) +
-    "\n```";
-  const parsed = parseJudgeResponse(raw);
-  assert.equal(parsed?.worthAsking, false);
-});
-
-test("parseJudgeResponse: rejects invalid JSON", () => {
-  assert.equal(parseJudgeResponse("not json at all"), null);
-});
-
-test("parseJudgeResponse: rejects worthAsking=true with a missing conceptTag", () => {
-  const raw = JSON.stringify({ worthAsking: true, conceptTag: null, questionConcept: "x", questionInstance: "y" });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects worthAsking=true with a missing questionInstance", () => {
-  const raw = JSON.stringify({ worthAsking: true, conceptTag: "tag", questionConcept: "x", questionInstance: "" });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects worthAsking=false with a non-null conceptTag (internally inconsistent)", () => {
-  const raw = JSON.stringify({ worthAsking: false, conceptTag: "tag", questionConcept: null, questionInstance: null });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a response missing worthAsking entirely", () => {
-  const raw = JSON.stringify({ conceptTag: "tag", questionConcept: "x", questionInstance: "y" });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a bare JSON array (not an object)", () => {
-  assert.equal(parseJudgeResponse("[]"), null);
-});
-
-test("parseJudgeResponse: rejects a conceptTag that isn't kebab-case", () => {
-  // Regression test: memoization is a plain string match against
-  // previously-stored tags, so a differently-formatted tag for the same
-  // concept (wrong case, spaces, punctuation) would silently defeat it.
-  // Found by an independent test pass.
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "Not Kebab Case!",
-    questionConcept: "x",
-    questionInstance: "y",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: accepts a multi-word kebab-case conceptTag", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "mutex-vs-channel-2",
-    questionConcept: "x",
-    questionInstance: "y",
-    sampleAnswerConcept: "sample x",
-    sampleAnswerInstance: "sample y",
-    conceptExplanation: "explanation",
-  });
-  assert.equal(parseJudgeResponse(raw)?.conceptTag, "mutex-vs-channel-2");
-});
-
-// --- parseJudgeResponse: sample answers + concept explanation contract ----
-//
-// Same enforcement posture as every other field this parser checks (kebab-
-// case tag, concept-first consistency): a response with a real question but
-// a missing/empty required sample answer or explanation is rejected as
-// malformed, never silently accepted with a null/missing field. See
-// DECISIONS.md's "sample answers and concept explanation" entry.
-
-test("parseJudgeResponse: rejects a concept question with no sample answer for it", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: "concept question",
-    questionInstance: "instance question",
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: "sample instance answer",
-    conceptExplanation: "explanation",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a concept question with a blank (whitespace-only) sample answer", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: "concept question",
-    questionInstance: "instance question",
-    sampleAnswerConcept: "   ",
-    sampleAnswerInstance: "sample instance answer",
-    conceptExplanation: "explanation",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a sampleAnswerConcept present when questionConcept is null (already-known concept)", () => {
-  // The inverse of the missing-sample-answer case: a sample answer for a
-  // question that wasn't even asked is just as inconsistent as the reverse.
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: null,
-    questionInstance: "instance question",
-    sampleAnswerConcept: "should not be here",
-    sampleAnswerInstance: "sample instance answer",
-    conceptExplanation: "explanation",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a missing sample answer for the instance question", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: null,
-    questionInstance: "instance question",
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: "",
-    conceptExplanation: "explanation",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a missing concept explanation even when both questions are otherwise well-formed", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: "concept question",
-    questionInstance: "instance question",
-    sampleAnswerConcept: "sample concept answer",
-    sampleAnswerInstance: "sample instance answer",
-    conceptExplanation: null,
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: rejects a missing concept explanation on an instance-only response (concept already known)", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "tag",
-    questionConcept: null,
-    questionInstance: "instance question",
-    sampleAnswerConcept: null,
-    sampleAnswerInstance: "sample instance answer",
-    conceptExplanation: "   ",
-  });
-  assert.equal(parseJudgeResponse(raw), null);
-});
-
-test("parseJudgeResponse: a fully well-formed response with both questions, both sample answers, and an explanation parses", () => {
-  const raw = JSON.stringify({
-    worthAsking: true,
-    conceptTag: "mutex-vs-channel",
-    questionConcept: "What is a mutex?",
-    questionInstance: "Why did this diff use one?",
-    sampleAnswerConcept: "A mutex is a mutual-exclusion lock.",
-    sampleAnswerInstance: "Because only one goroutine may touch the cache at a time.",
-    conceptExplanation: "A mutex protects a shared resource so only one thread accesses it at once.",
-  });
-  const parsed = parseJudgeResponse(raw);
-  assert.equal(parsed?.sampleAnswerConcept, "A mutex is a mutual-exclusion lock.");
-  assert.equal(parsed?.sampleAnswerInstance, "Because only one goroutine may touch the cache at a time.");
-  assert.equal(parsed?.conceptExplanation, "A mutex protects a shared resource so only one thread accesses it at once.");
-});
-
-// --- runGeneration: concept-first enforcement -----------------------------
-//
-// Regression coverage for a bug an independent test pass found: a mock
-// response for a never-before-answered concept tag, with no concept
-// question, used to be accepted as a successful instance-only event — that
-// would let the concept get marked "answered" the moment the instance
-// question was answered, without the concept question ever having been
-// asked. Grasp must reject this deterministically rather than trust the
-// model's self-report.
-
-const FIXTURE_CLAUDE_DIR = path.resolve(process.cwd(), "test/fixtures/mock-claude");
-
-function withMockClaude(env: Record<string, string>, fn: () => void): void {
-  const originalPath = process.env.PATH;
-  const originalEnv: Record<string, string | undefined> = {};
-  for (const key of Object.keys(env)) originalEnv[key] = process.env[key];
-  process.env.PATH = `${FIXTURE_CLAUDE_DIR}:${originalPath}`;
-  Object.assign(process.env, env);
-  try {
-    fn();
-  } finally {
-    process.env.PATH = originalPath;
-    for (const key of Object.keys(env)) {
-      if (originalEnv[key] === undefined) delete process.env[key];
-      else process.env[key] = originalEnv[key];
-    }
-  }
-}
-
-function tempDbPath(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grasp-test-gen-db-"));
-  return path.join(dir, "history.db");
-}
-
-function baseParams(overrides: Partial<GenerationParams> = {}): GenerationParams {
+function input(
+  mastery: Record<string, Tier> = {},
+  over: Partial<GenerationInput> = {},
+): GenerationInput {
   return {
-    sessionId: "test-session",
-    repo: "/tmp/test-repo",
-    significantFiles: [diffFile({ path: "a.ts", insertions: 10, deletions: 2 })],
-    config: testConfig(),
-    diffHash: null,
-    ...overrides,
+    kind: "live",
+    files: [...FILES],
+    masteryContext: mastery,
+    knownTags: ["debouncing", "auth-flow"],
+    diff: "--- a/src/hooks/useDebouncedSearch.ts\n+++ b/src/hooks/useDebouncedSearch.ts\n@@\n+const t = setTimeout(fn, delay);\n",
+    ...over,
+  } as GenerationInput;
+}
+
+function question(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    concept_tag: "debouncing",
+    reframe: false,
+    tier: "trace",
+    files: [FILES[0]],
+    teaching_card: null,
+    question: "If query changes three times within 300ms, how many times does setDebounced run?",
+    sample_answer: "Once — each keystroke clears the previous timer.",
+    hint: "Look at what happens to the previous timer.",
+    scaffold: ["What does the cleanup do?", "When does the effect re-run?"],
+    ...over,
   };
 }
 
-test("runGeneration: a brand-new concept tag with no concept question is rejected as malformed, not accepted", () => {
-  const db = openStore(tempDbPath());
-  const params = baseParams();
-  let outcome: ReturnType<typeof runGeneration> | undefined;
+function payload(
+  over: Record<string, unknown> = {},
+  questions?: Record<string, unknown>[],
+): string {
+  return JSON.stringify({
+    skip: false,
+    skip_reason: null,
+    questions: questions ?? [question()],
+    ...over,
+  });
+}
 
-  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
-    outcome = runGeneration(db, params);
+/** A provider that returns canned text and records what it was asked. */
+function fakeProvider(replies: string[]): ModelProvider & {
+  prompts: string[];
+  opts: AskOptions[];
+} {
+  let i = 0;
+  const prompts: string[] = [];
+  const opts: AskOptions[] = [];
+  return {
+    name: "api",
+    prompts,
+    opts,
+    askModel: async (prompt, options) => {
+      prompts.push(prompt);
+      opts.push(options);
+      return { text: replies[Math.min(i++, replies.length - 1)], usage: null };
+    },
+  };
+}
+
+function throwingProvider(errors: unknown[], success?: string): ModelProvider & { calls: number } {
+  const provider = {
+    name: "api" as const,
+    calls: 0,
+    askModel: async () => {
+      const error = errors[provider.calls];
+      provider.calls += 1;
+      if (error) throw error;
+      if (success) return { text: success, usage: null };
+      throw new Error("no reply configured");
+    },
+  };
+  return provider;
+}
+
+const noSleep = { sleep: async () => {}, random: () => 0 };
+
+describe("parsing (§9.4)", () => {
+  it("parses a clean payload", () => {
+    expect(parseModelJson(payload()).ok).toBe(true);
   });
 
-  assert.equal(outcome!.missReason, "error", "must be recorded as a miss, never a silent instance-only success");
-  assert.equal(outcome!.questionType, null);
-
-  const row = db.prepare("SELECT question_type, cost_usd FROM events WHERE id = ?").get(outcome!.eventId) as any;
-  assert.equal(row.question_type, null);
-  assert.equal(row.cost_usd, 0.001, "the call still cost money and that cost must still be recorded");
-
-  // The concept must NOT be memoized as taught — nothing should be
-  // learnable about "brand-new-concept" from this rejected event.
-  const tagRows = getConceptTagGlobal(db, "brand-new-concept", false);
-  assert.equal(tagRows.length, 0);
-  db.close();
-});
-
-// Regression coverage for a release-blocking privacy bug an independent test
-// pass found: `--allowedTools ""` only extends Claude Code's tool
-// allow-list — it does not disable the built-in tool set, and does nothing
-// to stop a nested `claude -p` call from loading the calling repo's
-// CLAUDE.md/skills/plugins/hooks/MCP config or a user's own pre-existing
-// tool allow-rules. Asserts the actual argv invokeClaudeJudge shells out
-// with, so a future accidental revert to `--allowedTools ""` fails a test
-// instead of silently shipping. See DECISIONS.md's "Generation call
-// tool/context isolation flags" entry.
-test("runGeneration: invokes claude with real tool/context isolation flags, not the old ineffective --allowedTools \"\"", () => {
-  const db = openStore(tempDbPath());
-  const params = baseParams();
-  const argvLogPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "grasp-test-argv-")), "argv.json");
-
-  withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_ARGV_LOG: argvLogPath }, () => {
-    runGeneration(db, params);
+  it("strips ```json fences the prompt forbids but models emit anyway", () => {
+    expect(stripFences('```json\n{"a":1}\n```')).toBe('{"a":1}');
+    expect(parseModelJson("```\n" + payload() + "\n```").ok).toBe(true);
   });
 
-  const argv: string[] = JSON.parse(fs.readFileSync(argvLogPath, "utf-8"));
-  assert.ok(argv.includes("--tools"), "must disable all built-in tools via --tools");
-  assert.equal(argv[argv.indexOf("--tools") + 1], "", "--tools must be passed an empty string to disable everything");
-  assert.ok(argv.includes("--safe-mode"), "must disable CLAUDE.md/skills/plugins/hooks/MCP loading via --safe-mode");
-  assert.ok(argv.includes("--setting-sources"), "must exclude user/project/local settings via --setting-sources");
-  assert.equal(argv[argv.indexOf("--setting-sources") + 1], "");
-  assert.ok(argv.includes("--strict-mcp-config"), "must reject any MCP config as defense-in-depth");
-  assert.ok(!argv.includes("--allowedTools"), "must not use the ineffective --allowedTools flag");
-
-  db.close();
-});
-
-test("runGeneration: the SAME response shape is accepted once the concept is already answered (no violation)", () => {
-  const db = openStore(tempDbPath());
-  // Pre-seed the concept tag as already answered via a prior event.
-  db.exec(`
-    INSERT INTO events (timestamp, repo, session_id, question_type, generation_source)
-    VALUES ('2020-01-01T00:00:00.000Z', '/tmp/test-repo', 'prior-session', 'both', 'test-seed');
-  `);
-  const eventId = db.prepare(`SELECT id FROM events WHERE session_id = 'prior-session'`).get() as { id: number };
-  db.prepare(`INSERT INTO concept_tags (event_id, tag, answered) VALUES (?, 'brand-new-concept', 1)`).run(eventId.id);
-
-  const params = baseParams();
-  let outcome: ReturnType<typeof runGeneration> | undefined;
-
-  withMockClaude({ GRASP_TEST_MOCK_MODE: "brand-new-concept-no-question" }, () => {
-    outcome = runGeneration(db, params);
+  it("recovers a single object wrapped in prose", () => {
+    const parsed = parseModelJson("Here you go:\n" + payload() + "\nHope that helps!");
+    expect(parsed.ok).toBe(true);
   });
 
-  assert.equal(outcome!.missReason, null);
-  assert.equal(outcome!.questionType, "instance");
-  db.close();
+  it("rejects empty and non-JSON output", () => {
+    expect(parseModelJson("   ")).toEqual({ ok: false, error: "model returned an empty response" });
+    expect(parseModelJson("no json here")).toEqual({
+      ok: false,
+      error: "response was not valid JSON",
+    });
+  });
 });
 
-// --- runGeneration: sample answers + explanation land on the stored event -
-
-test("runGeneration: a well-formed response's sample answers and concept explanation are all stored on the event", () => {
-  const db = openStore(tempDbPath());
-  const params = baseParams();
-  let outcome: ReturnType<typeof runGeneration> | undefined;
-
-  withMockClaude({ GRASP_TEST_MOCK_MODE: "normal", GRASP_TEST_MOCK_COST: "0.001" }, () => {
-    outcome = runGeneration(db, params);
+describe("validation (§9.4)", () => {
+  it("accepts a valid payload", () => {
+    const result = validateGenerationResult(JSON.parse(payload()), input({ debouncing: "none" }));
+    expect(result.ok).toBe(true);
   });
 
-  assert.equal(outcome!.missReason, null);
-  assert.equal(outcome!.questionType, "both");
+  it("skip:true needs a reason and no questions", () => {
+    const ok = validateGenerationResult({ skip: true, skip_reason: "lockfile bump" }, input());
+    expect(ok).toEqual({
+      ok: true,
+      value: { skip: true, skip_reason: "lockfile bump", questions: [] },
+      warnings: [],
+    });
 
-  const row = db
-    .prepare("SELECT sample_answer_concept, sample_answer_instance, concept_explanation FROM events WHERE id = ?")
-    .get(outcome!.eventId) as any;
-  assert.equal(row.sample_answer_concept, "sample answer for concept 0");
-  assert.equal(row.sample_answer_instance, "sample answer for instance 0");
-  assert.equal(row.concept_explanation, "explanation for concept 0");
-  db.close();
+    expect(validateGenerationResult({ skip: true }, input()).ok).toBe(false);
+    expect(
+      validateGenerationResult({ skip: true, skip_reason: "x", questions: [question()] }, input())
+        .ok,
+    ).toBe(false);
+  });
+
+  it.each([
+    ["unknown tier", question({ tier: "expert" })],
+    [
+      "missing sample_answer",
+      (() => {
+        const q = question();
+        delete q.sample_answer;
+        return q;
+      })(),
+    ],
+    ["empty question text", question({ question: "  " })],
+    ["a non-hyphenated tag", question({ concept_tag: "Auth Flow" })],
+    ["a non-boolean reframe", question({ reframe: "yes" })],
+    ["no files", question({ files: [] })],
+    ["a teaching card with no body", question({ teaching_card: { deeper: "x" } })],
+    ["trace with no scaffold", question({ scaffold: [] })],
+  ])("rejects %s without coercing it", (_label, bad) => {
+    const result = validateGenerationResult(JSON.parse(payload({}, [bad])), input());
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects more than three questions (§9.4)", () => {
+    const four = [question(), question(), question(), question()];
+    const result = validateGenerationResult(JSON.parse(payload({}, four)), input());
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.violations[0]).toMatch(/at most 3/);
+  });
+
+  it("rejects a non-object response and a missing skip flag", () => {
+    expect(validateGenerationResult([1, 2], input()).ok).toBe(false);
+    expect(validateGenerationResult({ questions: [] }, input()).ok).toBe(false);
+    expect(validateGenerationResult({ skip: false, questions: [] }, input()).ok).toBe(false);
+    expect(validateGenerationResult({ skip: false, questions: "no" }, input()).ok).toBe(false);
+  });
+
+  it("defaults absent optional fields instead of failing", () => {
+    const bare = question();
+    delete bare.reframe;
+    delete bare.teaching_card;
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [bare])),
+      input({ debouncing: "trace" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.questions[0].reframe).toBe(false);
+      expect(result.value.questions[0].teaching_card).toBeNull();
+    }
+  });
 });
 
-// --- isTimeoutError ---------------------------------------------------------
+describe("tier clamping (§9.2 step 4, §9.6)", () => {
+  const RANK = { trace: 0, predict_break: 1, reconstruct: 2 } as const;
 
-test("isTimeoutError: true for a caught execFileSync timeout error (code ETIMEDOUT)", () => {
-  assert.equal(isTimeoutError({ code: "ETIMEDOUT", signal: "SIGTERM" }), true);
+  it.each([
+    ["none", "trace"],
+    ["trace", "predict_break"],
+    ["predict_break", "reconstruct"],
+    ["reconstruct", "reconstruct"],
+  ] as const)("mastery %s sets a ceiling of tier %s", (mastery, ceiling) => {
+    expect(tierForMastery(mastery)).toBe(ceiling);
+    // The mastery map is a ceiling: never store a tier above it, never promote
+    // a question written for a lower one.
+    for (const claimed of ["trace", "predict_break", "reconstruct"] as const) {
+      const q = question({ tier: claimed, scaffold: ["a", "b"] });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        input({ debouncing: mastery }),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        const stored = result.value.questions[0].tier;
+        expect(RANK[stored]).toBeLessThanOrEqual(RANK[ceiling]);
+        expect(stored).toBe(RANK[claimed] > RANK[ceiling] ? ceiling : claimed);
+      }
+    }
+  });
+
+  it("never promotes a question written for a lower tier", () => {
+    // Observed in a real run: a predict_break question names the identifiers it
+    // asks about. Promoting it to reconstruct hides the code those names refer
+    // to, leaving a question about something the user cannot see.
+    const q = question({ tier: "predict_break", scaffold: ["a", "b"] });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "predict_break" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.questions[0].tier).toBe("predict_break");
+      expect(result.warnings.join(" ")).toMatch(/below the "reconstruct"/);
+    }
+  });
+
+  it("clamps a reconstruct question down when the concept is brand new", () => {
+    // The failure this prevents: code hidden (§10.1) for a concept never seen.
+    const q = question({ tier: "reconstruct", scaffold: ["a", "b"] });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "none" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.questions[0].tier).toBe("trace");
+      expect(result.warnings.join(" ")).toMatch(/clamped down to "trace"/);
+    }
+  });
+
+  it("treats an unknown tag as mastery none", () => {
+    const q = question({
+      concept_tag: "brand-new-idea",
+      tier: "reconstruct",
+      scaffold: ["a", "b"],
+    });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "reconstruct" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.questions[0].tier).toBe("trace");
+  });
+
+  it("warns, rather than failing, when the clamp leaves a trace question scaffold-less", () => {
+    const q = question({ tier: "predict_break", scaffold: [] });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "none" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.warnings.join(" ")).toMatch(/nothing to break down/);
+  });
 });
 
-test("isTimeoutError: false for a plain nonzero-exit failure (no code)", () => {
-  assert.equal(isTimeoutError({ status: 1, signal: null }), false);
+describe("file attribution (§13.3, §16.4)", () => {
+  it("drops a hallucinated path and keeps the real ones", () => {
+    const q = question({ files: [FILES[0], "src/does/not/exist.ts"] });
+    const result = validateGenerationResult(JSON.parse(payload({}, [q])), input());
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.questions[0].files).toEqual([FILES[0]]);
+      expect(result.warnings.join(" ")).toMatch(/not in the batch — dropped/);
+    }
+  });
+
+  it("promotes an all-hallucinated list to a violation", () => {
+    const q = question({ files: ["nope.ts", "also-nope.ts"] });
+    const result = validateGenerationResult(JSON.parse(payload({}, [q])), input());
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.violations.join(" ")).toMatch(/named no file from this batch/);
+  });
+
+  it("stores the batch's spelling, not the model's echo", () => {
+    const q = question({ files: ["./" + FILES[0]] });
+    const result = validateGenerationResult(JSON.parse(payload({}, [q])), input());
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.questions[0].files).toEqual([FILES[0]]);
+  });
+
+  it("honors platform case rules", () => {
+    expect(pathsEqual("src/Auth.ts", "src/auth.ts", true)).toBe(true);
+    expect(pathsEqual("src/Auth.ts", "src/auth.ts", false)).toBe(false);
+    expect(pathsEqual("src\\auth\\mw.ts", "src/auth/mw.ts", false)).toBe(true);
+  });
 });
 
-test("isTimeoutError: false for a SIGTERM that isn't actually a timeout (code absent)", () => {
-  // Empirically verified in this project (see DECISIONS.md's "Timeout
-  // detection mechanism" entry): signal alone is not a safe enough signal,
-  // code is what's actually checked.
-  assert.equal(isTimeoutError({ signal: "SIGTERM" }), false);
+describe("softer rules stay warnings", () => {
+  it("keeps a teaching card generated above mastery none", () => {
+    const q = question({ teaching_card: { body: "Debouncing delays an action.", deeper: null } });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "trace" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.questions[0].teaching_card).not.toBeNull();
+      expect(result.warnings.join(" ")).toMatch(/null unless none/);
+    }
+  });
+
+  it("notes a missing card at mastery none, and an odd scaffold length", () => {
+    const q = question({ scaffold: ["a", "b", "c", "d", "e"] });
+    const result = validateGenerationResult(
+      JSON.parse(payload({}, [q])),
+      input({ debouncing: "none" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.warnings.join(" ")).toMatch(/no teaching card/);
+      expect(result.warnings.join(" ")).toMatch(/asks for 2-4/);
+    }
+  });
 });
 
-test("isTimeoutError: false for non-object/null inputs", () => {
-  assert.equal(isTimeoutError(null), false);
-  assert.equal(isTimeoutError("some string"), false);
-  assert.equal(isTimeoutError(undefined), false);
+describe("prompt assembly (§9.3)", () => {
+  it("caps known tags at 60, most-recent-first", () => {
+    const tags = Array.from({ length: 90 }, (_, i) => `tag-${i}`);
+    const message = buildUserMessage(input({}, { knownTags: tags }));
+    expect(message).toContain("tag-0");
+    expect(message).toContain(`tag-${MAX_KNOWN_TAGS - 1}`);
+    expect(message).not.toContain(`tag-${MAX_KNOWN_TAGS}`);
+  });
+
+  it("labels the mode and carries mastery, files, and the diff", () => {
+    const message = buildUserMessage(input({ debouncing: "trace" }));
+    expect(message).toMatch(/MODE: live/);
+    expect(message).toContain("debouncing: trace");
+    expect(message).toContain(FILES[0]);
+    expect(message).toContain("setTimeout");
+  });
+
+  it("frames scan mode as existing code, not a change", () => {
+    const message = buildUserMessage({
+      kind: "scan",
+      files: [FILES[0]],
+      masteryContext: {},
+      knownTags: [],
+      section: "export const x = 1;",
+      sectionLabel: "section 2 of 4",
+    });
+    expect(message).toMatch(/MODE: scan/);
+    expect(message).toContain("section 2 of 4");
+    expect(message).toMatch(/nothing tracked yet/);
+  });
 });
 
-// --- buildDiffSummary --------------------------------------------------------
+describe("generateQuestions transport (§9.6)", () => {
+  it("returns the parsed result on the first attempt", async () => {
+    const provider = fakeProvider([payload()]);
+    const outcome = await generateQuestions(input({ debouncing: "none" }), {
+      provider,
+      ...noSleep,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.attempts).toBe(1);
+      expect(outcome.result.questions).toHaveLength(1);
+    }
+    expect(provider.opts[0].maxTokens).toBe(MAX_TOKENS);
+  });
 
-test("buildDiffSummary: single file, correct +/- counts and file list", () => {
-  const summary = buildDiffSummary([diffFile({ path: "a.ts", insertions: 4, deletions: 1 })]);
-  assert.equal(summary, "1 file changed (+4/-1): a.ts");
+  it("repairs malformed output exactly once, showing the model its own output", async () => {
+    const provider = fakeProvider(["not json at all", payload()]);
+    const outcome = await generateQuestions(input(), { provider, ...noSleep });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.attempts).toBe(2);
+    expect(provider.prompts).toHaveLength(2);
+    expect(provider.prompts[1]).toContain("not json at all");
+    expect(provider.prompts[1]).toMatch(/ONLY the corrected JSON/);
+  });
+
+  it("fails after the second malformed attempt, keeping the re-runnable payload", async () => {
+    const provider = fakeProvider(["nope", "still nope"]);
+    const original = input({ debouncing: "trace" });
+    const outcome = await generateQuestions(original, { provider, ...noSleep });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("malformed_output");
+      expect(outcome.attempts).toBe(2);
+      // §19.1: everything needed to re-run without re-deriving it.
+      expect(outcome.payload).toEqual(original);
+      expect(outcome.violations).toContain("response was not valid JSON");
+    }
+  });
+
+  it("backs off 1s/4s/10s on retryable errors, then succeeds", async () => {
+    const slept: number[] = [];
+    const provider = throwingProvider(
+      [new ProviderError("api_error", true, "429"), new ProviderError("api_error", true, "500")],
+      payload(),
+    );
+    const outcome = await generateQuestions(input(), {
+      provider,
+      sleep: async (ms) => void slept.push(ms),
+      random: () => 0,
+    });
+    expect(outcome.ok).toBe(true);
+    expect(slept).toEqual([API_RETRY_DELAYS_MS[0], API_RETRY_DELAYS_MS[1]]);
+    expect(provider.calls).toBe(3);
+  });
+
+  it("gives up after three retries", async () => {
+    const provider = throwingProvider(
+      Array.from({ length: 9 }, () => new ProviderError("api_error", true, "503")),
+    );
+    const slept: number[] = [];
+    const outcome = await generateQuestions(input(), {
+      provider,
+      sleep: async (ms) => void slept.push(ms),
+      random: () => 0,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(slept).toHaveLength(API_RETRY_DELAYS_MS.length);
+    expect(provider.calls).toBe(API_RETRY_DELAYS_MS.length + 1);
+  });
+
+  it("never retries an auth failure, and never leaks the key", async () => {
+    const provider = throwingProvider([
+      new ProviderError(
+        "auth_error",
+        false,
+        "authentication failed (HTTP 401) — check your API key: sk-ant-***",
+      ),
+    ]);
+    const outcome = await generateQuestions(input(), { provider, ...noSleep });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("auth_error");
+      expect(outcome.error).toMatch(/check your API key/);
+      expect(outcome.error).not.toMatch(/sk-ant-api/);
+    }
+    expect(provider.calls).toBe(1);
+  });
+
+  it("reports a resolution failure without ever calling a model", async () => {
+    const outcome = await generateQuestions(input(), {
+      providerSetting: "api",
+      apiKey: null,
+      runCli: async () => ({ stdout: "", stderr: "", code: 1, timedOut: false }),
+      ...noSleep,
+    });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("auth_error");
+      expect(outcome.attempts).toBe(0);
+    }
+  });
+
+  it("wraps a non-ProviderError throw instead of letting it escape", async () => {
+    const provider: ModelProvider = {
+      name: "api",
+      askModel: async () => {
+        throw new TypeError("something in the transport blew up");
+      },
+    };
+    const outcome = await generateQuestions(input(), { provider, ...noSleep });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("api_error");
+      expect(outcome.error).toMatch(/blew up/);
+    }
+  });
+
+  it("warns when skip_reason is set alongside skip:false", async () => {
+    const provider = fakeProvider([payload({ skip_reason: "contradictory" })]);
+    const outcome = await generateQuestions(input({ debouncing: "none" }), {
+      provider,
+      ...noSleep,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.warnings.join(" ")).toMatch(/skip_reason/);
+  });
+
+  it("skip:true is a success, not a failure — the checkpoint may advance (§8.3)", async () => {
+    const provider = fakeProvider([
+      JSON.stringify({ skip: true, skip_reason: "dependency bump only" }),
+    ]);
+    const outcome = await generateQuestions(input(), { provider, ...noSleep });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.result.skip).toBe(true);
+      expect(outcome.result.questions).toHaveLength(0);
+    }
+  });
 });
 
-test("buildDiffSummary: multiple files, summed insertions/deletions, comma-joined list", () => {
-  const summary = buildDiffSummary([
-    diffFile({ path: "a.ts", insertions: 4, deletions: 1 }),
-    diffFile({ path: "b.ts", insertions: 2, deletions: 3 }),
-  ]);
-  assert.equal(summary, "2 files changed (+6/-4): a.ts, b.ts");
+describe("synthesis (§9.5)", () => {
+  const bundle = {
+    kind: "synthesis" as const,
+    tag: "auth-flow",
+    files: FILES,
+    bundle: [
+      { files: [FILES[0]], code: "a", question: "asked before" },
+      { files: [FILES[1]], code: "b" },
+    ],
+  };
+
+  it("accepts exactly the three-field contract", () => {
+    const ok = validateSynthesisResult({ question: "q", sample_answer: "a", hint: "h" });
+    expect(ok.ok).toBe(true);
+    expect(validateSynthesisResult({ question: "q", sample_answer: "a" }).ok).toBe(false);
+    expect(validateSynthesisResult("nope").ok).toBe(false);
+  });
+
+  it("round-trips through the provider", async () => {
+    const provider = fakeProvider([
+      JSON.stringify({ question: "q", sample_answer: "a", hint: "h" }),
+    ]);
+    const outcome = await generateSynthesisQuestion(bundle, { provider, ...noSleep });
+    expect(outcome.ok).toBe(true);
+    expect(provider.prompts[0]).toContain("auth-flow");
+    expect(provider.prompts[0]).toContain("asked before");
+  });
 });
 
-test("buildDiffSummary: zero files", () => {
-  assert.equal(buildDiffSummary([]), "0 files changed (+0/-0): ");
+describe("reconstruct leak check (§9.2, §9.6)", () => {
+  // A slice of the shape that broke the prompt-only rule: a third-party parser.
+  const PARSER_CODE = [
+    "class BinOpNode(Node):",
+    "    def __init__(self, op, left, right):",
+    "        self.op = op",
+    "",
+    "class Parser:",
+    "    def parse_expr(self) -> Node:",
+    "        node = self.parse_term()",
+    "        while self.peek().type in (PLUS, MINUS):",
+    "            value = self.advance()",
+    "            node = BinOpNode(value, node, self.parse_term())",
+    "        return node",
+    "",
+    "    def parse_power(self) -> Node:",
+    "        base = self.parse_unary()",
+    "        return base",
+  ].join("\n");
+
+  const scanInput = (mastery: Record<string, Tier>): GenerationInput => ({
+    kind: "scan",
+    files: ["main.py"],
+    masteryContext: mastery,
+    knownTags: [],
+    section: PARSER_CODE,
+  });
+
+  function reconstructQuestion(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return question({
+      concept_tag: "recursive-descent-parsing",
+      tier: "reconstruct",
+      files: ["main.py"],
+      teaching_card: null,
+      question:
+        "You need to evaluate arithmetic expressions with correct operator precedence. Before looking: how would you structure the parsing?",
+      hint: "Think about what has to happen before you can decide precedence.",
+      sample_answer:
+        "One function per precedence level; parse_expr delegates to parse_term, which builds a BinOpNode.",
+      scaffold: ["Which operators bind tightest?", "How does a level hand off to the next?"],
+      ...over,
+    });
+  }
+
+  describe("identifier extraction", () => {
+    it("finds declared functions, methods, and classes across languages", () => {
+      const found = extractDeclaredIdentifiers(PARSER_CODE);
+      expect(found).toContain("parse_expr");
+      expect(found).toContain("parse_power");
+      expect(found).toContain("BinOpNode");
+      expect(found).toContain("Parser");
+    });
+
+    it("ignores generic locals, which would false-positive on prose", () => {
+      const found = extractDeclaredIdentifiers(PARSER_CODE);
+      expect(found).not.toContain("value");
+      expect(found).not.toContain("node");
+      expect(found).not.toContain("base");
+      expect(found).not.toContain("op");
+    });
+
+    it.each([
+      ["parse_expr", true],
+      ["BinOpNode", true],
+      ["pathsEqual", true],
+      ["Parser", true],
+      ["run", false],
+      ["get", false],
+      ["data", false],
+      ["if", false],
+      // Observed false positive: a clean question saying "should evaluate as"
+      // was flagged because the file declared `def evaluate`, costing a repair
+      // retry and a tier downgrade. A lone lowercase word reads as prose.
+      ["evaluate", false],
+      ["tokenize", false],
+    ])("treats %s as distinctive=%s", (name, expected) => {
+      expect(isDistinctiveIdentifier(name)).toBe(expected);
+    });
+
+    it("does not flag an English word that happens to be a function name", () => {
+      const code = "def evaluate(node):\n    return node\n";
+      const declared = extractDeclaredIdentifiers(code);
+      expect(findLeakedIdentifiers("`2 ^ 3 ^ 2` should evaluate as 512", declared)).toEqual([]);
+    });
+
+    it("reads declarations out of a diff's added lines", () => {
+      const diff =
+        "--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1,4 @@\n context\n+export function parseHeaders(raw: string) {\n+  return raw;\n+}\n";
+      expect(extractDeclaredIdentifiers(diff)).toContain("parseHeaders");
+    });
+
+    it("handles JS/TS declaration forms", () => {
+      const code = [
+        "export class TokenStream {}",
+        "const buildIndex = (rows) => rows;",
+        "interface ParserOptions {}",
+        "function normalizePath(p) { return p; }",
+      ].join("\n");
+      const found = extractDeclaredIdentifiers(code);
+      expect(found).toEqual(
+        expect.arrayContaining(["TokenStream", "buildIndex", "ParserOptions", "normalizePath"]),
+      );
+    });
+  });
+
+  describe("matching", () => {
+    it("matches whole identifiers only, case-sensitively", () => {
+      const ids = ["parse_expr", "BinOpNode"];
+      expect(findLeakedIdentifiers("call parse_expr first", ids)).toEqual(["parse_expr"]);
+      // A longer identifier that merely starts with it is a different symbol.
+      expect(findLeakedIdentifiers("see parse_expr_list", ids)).toEqual([]);
+      expect(findLeakedIdentifiers("each binopnode in the tree", ids)).toEqual([]);
+      expect(findLeakedIdentifiers("nothing to see", ids)).toEqual([]);
+    });
+  });
+
+  describe("enforcement", () => {
+    it("rejects a hint that names hidden code", () => {
+      const q = reconstructQuestion({ hint: "Look at what parse_expr does with the operator." });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.violations.join(" ")).toMatch(/hint: parse_expr/);
+    });
+
+    it("rejects a scaffold entry that names hidden code", () => {
+      const q = reconstructQuestion({
+        scaffold: [
+          "Which operators bind tightest?",
+          "What does parse_power return for a BinOpNode?",
+        ],
+      });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.violations.join(" ")).toMatch(/scaffold\[1\]: parse_power/);
+        expect(result.violations.join(" ")).toMatch(/BinOpNode/);
+      }
+    });
+
+    it("exempts sample_answer, which is shown after the code is revealed", () => {
+      // The fixture's sample_answer already names parse_expr and BinOpNode.
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [reconstructQuestion()])),
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it("does not check tiers where the code stays visible", () => {
+      const q = reconstructQuestion({ hint: "Look at what parse_expr does." });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        // mastery trace ⇒ ceiling predict_break ⇒ code visible ⇒ names are fine
+        scanInput({ "recursive-descent-parsing": "trace" }),
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value.questions[0].tier).toBe("predict_break");
+    });
+
+    it("downgrades instead of discarding when the repair retry still leaks", () => {
+      const q = reconstructQuestion({ hint: "Look at what parse_expr does." });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+        { finalAttempt: true },
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.questions[0].tier).toBe("predict_break");
+        expect(result.warnings.join(" ")).toMatch(/downgraded to predict_break/);
+      }
+    });
+
+    it("repairs once, then keeps the question at a lower tier end to end", async () => {
+      const leaky = payload({}, [reconstructQuestion({ hint: "Trace parse_expr from the top." })]);
+      const provider = fakeProvider([leaky, leaky]);
+      const outcome = await generateQuestions(
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+        { provider, ...noSleep },
+      );
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.attempts).toBe(2); // one repair retry was spent
+        expect(outcome.result.questions[0].tier).toBe("predict_break");
+        // §9.7: a two-attempt success must say what the first attempt got wrong.
+        expect(outcome.repairedViolations.join(" ")).toMatch(/names hidden code/);
+      }
+      expect(provider.prompts[1]).toMatch(/names hidden code/);
+    });
+
+    it("requires a scaffold at reconstruct — [b] must have something to show", () => {
+      // §10.4: the scaffold is the deepest rung of the stuck flow, and
+      // reconstruct is where a stuck user has nothing else — the code is hidden.
+      const q = reconstructQuestion({ scaffold: [] });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.violations.join(" ")).toMatch(/reconstruct tier requires 2-4/);
+    });
+
+    it("still allows predict_break without a scaffold", () => {
+      const q = reconstructQuestion({ tier: "predict_break", scaffold: [] });
+      const result = validateGenerationResult(
+        JSON.parse(payload({}, [q])),
+        scanInput({ "recursive-descent-parsing": "trace" }),
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it("keeps a clean reconstruct question at reconstruct", async () => {
+      const provider = fakeProvider([payload({}, [reconstructQuestion()])]);
+      const outcome = await generateQuestions(
+        scanInput({ "recursive-descent-parsing": "predict_break" }),
+        { provider, ...noSleep },
+      );
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.attempts).toBe(1);
+        expect(outcome.result.questions[0].tier).toBe("reconstruct");
+        expect(outcome.repairedViolations).toEqual([]);
+      }
+    });
+  });
 });
 
-// --- acquireGenerationSlot ---------------------------------------------------
-//
-// Regression coverage for the "queued generation calls exceed the outer hook
-// timeout" bug an independent test pass found: the slot-wait deadline used
-// to be sized purely off the reservation's staleness window, with no regard
-// for how long the CALLER's own subsequent generation call still had left to
-// run, so a queued caller could still be in-flight (or dead) when Claude
-// Code's own 45s hook timeout killed the whole process with nothing
-// recorded. runGeneration's own deadline is derived from hardcoded
-// multi-second constants (TOTAL_CALL_BUDGET_MS/GENERATION_TIMEOUT_MS) not
-// worth waiting out in a fast unit test — these tests instead exercise
-// acquireGenerationSlot directly with small, explicit deadlines to pin its
-// actual contract: succeed immediately if free, succeed once freed before
-// the deadline, give up (return null) once the deadline passes.
+describe("fenced output is tolerated, not fought (§9.4)", () => {
+  it("no longer tells the model to avoid fences", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).not.toMatch(/no markdown fences/i);
+    expect(prompt).toMatch(/fence around the object is fine/i);
+  });
 
-test("acquireGenerationSlot: succeeds immediately when the slot is free", () => {
-  const db = openStore(tempDbPath());
-  const token = acquireGenerationSlot(db, "slot-session", Date.now() + 1000);
-  assert.ok(token);
-  db.close();
+  it("accepts a fenced payload with no repair retry", async () => {
+    const provider = fakeProvider(["```json\n" + payload() + "\n```"]);
+    const outcome = await generateQuestions(input({ debouncing: "none" }), {
+      provider,
+      ...noSleep,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.attempts).toBe(1);
+  });
 });
-
-test("acquireGenerationSlot: gives up (returns null) once the deadline passes while another holder is live", () => {
-  const db = openStore(tempDbPath());
-  const holderToken = tryClaimGenerationSlot(db, "slot-session");
-  assert.ok(holderToken, "setup: first claim must succeed");
-
-  const start = Date.now();
-  const result = acquireGenerationSlot(db, "slot-session", start + 250);
-  const elapsed = Date.now() - start;
-
-  assert.equal(result, null, "must give up once its own deadline passes, not wait out the full staleness window");
-  assert.ok(elapsed < 2000, `should give up close to its 250ms deadline, took ${elapsed}ms`);
-
-  releaseGenerationSlot(db, "slot-session", holderToken as string);
-  db.close();
-});
-
-// A test for "acquires once a prior holder releases, before its own
-// deadline" needs a SEPARATE process to do that release, not a same-process
-// setTimeout/thread — acquireGenerationSlot's poll loop blocks the whole
-// thread synchronously (Atomics.wait), same as the real generation call it
-// guards, so nothing else on this thread (including a timer callback) can
-// run until it returns. The real multi-process regression tests in
-// test/generationCapRace.test.ts already exercise exactly this path end to
-// end (each of 6 real OS-process workers acquires only after an earlier one
-// releases, well within its deadline) — see that file's own comment.

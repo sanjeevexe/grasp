@@ -1,37 +1,78 @@
 {
-  "name": "grasp-cli",
+  "name": "grasp",
   "version": "0.1.0",
-  "description": "A terminal-native CLI that generates comprehension questions about your AI coding agent's changes, answered on your own schedule in `grasp review` (with an optional hard gate on the agent's next action).",
+  "description": "Forces active comprehension of AI-generated code before you move on — any AI tool, any interface.",
   "license": "MIT",
-  "type": "commonjs",
-  "bin": {
-    "grasp": "dist/cli.js"
+  "author": "Sanjeev Varma",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanjeevexe/grasp.git"
   },
-  "main": "dist/cli.js",
-  "files": [
-    "dist"
+  "bugs": {
+    "url": "https://github.com/sanjeevexe/grasp/issues"
+  },
+  "homepage": "https://github.com/sanjeevexe/grasp#readme",
+  "keywords": [
+    "ai",
+    "cli",
+    "developer-tools",
+    "learning",
+    "code-review"
   ],
-  "engines": {
-    "node": ">=22"
+  "bin": {
+    "grasp": "./dist/cli/index.js"
   },
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
-    "pretest": "npm run build",
-    "test": "tsc -p tsconfig.test.json && node --test test-dist/test/*.test.js",
-    "pretest:e2e": "npm run build && tsc -p tsconfig.test.json",
-    "test:e2e": "node test-dist/test/e2e/runner.js",
-    "prepublishOnly": "npm run build"
+    "build": "tsc && node scripts/copy-schema.mjs",
+    "dev": "tsx src/cli/index.ts",
+    "dev:generate": "tsx scripts/dev-generate.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src test scripts --max-warnings 0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run lint && npm run test && npm run build",
+    "seed:review": "tsx scripts/seed-review.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.2",
-    "ink": "^5.2.1",
-    "ink-text-input": "^6.0.0",
-    "react": "^18.3.1"
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@babel/parser": "^8.0.4",
+    "chalk": "^5.3.0",
+    "chokidar": "^4.0.3",
+    "commander": "^12.0.0",
+    "diff": "^5.2.0",
+    "node-notifier": "^10.0.1",
+    "picomatch": "^4.0.2",
+    "prompts": "^2.4.2",
+    "simple-git": "^3.25.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
-    "@types/node": "^22.10.2",
-    "@types/react": "^18.3.31",
-    "typescript": "^5.7.2"
+    "@types/diff": "^5.2.0",
+    "@types/node": "^24.13.3",
+    "@types/node-notifier": "^8.0.0",
+    "@types/picomatch": "^3.0.0",
+    "@types/prompts": "^2.4.9",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^5.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0",
+    "vitest": "^5.0.0"
+  },
+  "overrides": {
+    "node-notifier": {
+      "uuid": "^11.1.0"
+    }
   }
 }

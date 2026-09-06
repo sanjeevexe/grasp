@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a focused improvement to Grasp.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Explain the learning or workflow problem before proposing a solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Product fit
+      options:
+        - label: This keeps answer assessment self-reported.
+        - label: This does not require editor-specific capture.
+        - label: This does not add scheduled or nagging review reminders.
